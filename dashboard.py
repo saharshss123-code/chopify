@@ -120,6 +120,7 @@ class Studio:
     def _run(self, path, action, preview, pick):
         cmd = [sys.executable, str(HERE / "chopify.py"), "--project", str(path),
                "--action", action, "--out", str(path / ("previews" if preview else "clips"))]
+        cmd.append("--no-input")
         if preview:
             cmd.append("--preview")
         if pick:
@@ -131,7 +132,9 @@ class Studio:
                 with self.lock:
                     if self.closing:
                         return
-                    child = subprocess.Popen(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
+                    child = subprocess.Popen(
+                        cmd, cwd=HERE, stdin=subprocess.DEVNULL,
+                        stdout=log, stderr=subprocess.STDOUT)
                     self.processes.add(child)
                 try:
                     code = child.wait()

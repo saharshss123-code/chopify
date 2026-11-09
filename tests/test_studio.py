@@ -339,7 +339,9 @@ def test_studio_queue_writes_log_before_starting_worker(tmp_path, monkeypatch):
         def wait(self):
             return 0
 
-    def popen(_cmd, cwd, stdout, stderr):
+    def popen(cmd, cwd, stdin, stdout, stderr):
+        assert "--no-input" in cmd
+        assert stdin is dashboard.subprocess.DEVNULL
         stdout.write("worker output\n")
         stdout.flush()
         return Process()
