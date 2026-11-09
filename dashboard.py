@@ -104,8 +104,18 @@ class Studio:
                 raise ValueError("This project is already queued or running.")
             state = projects.read_project(path)
             state.update(status="queued", stage=action, error=None)
+            with (path / "job.log").open("w", encoding="utf-8") as log:
+                log.write(f"Queued {action} job.\n")
             projects.save_project(path, state)
-            self.futures[project_id] = self.executor.submit(self._run, path, action, preview, pick)
+            try:
+                self.futures[project_id] = self.executor.submit(
+                    self._run, path, action, preview, pick)
+            except RuntimeError as exc:
+                state.update(status="failed", error=f"Could not queue job: {exc}")
+                projects.save_project(path, state)
+                with (path / "job.log").open("a", encoding="utf-8") as log:
+                    log.write(f"Could not queue job: {exc}\n")
+                raise
 
     def _run(self, path, action, preview, pick):
         cmd = [sys.executable, str(HERE / "chopify.py"), "--project", str(path),
@@ -115,16 +125,22 @@ class Studio:
         if pick:
             cmd += ["--clips", pick]
         try:
-            with (path / "job.log").open("w", encoding="utf-8") as log:
+            with (path / "job.log").open("a", encoding="utf-8") as log:
+                log.write("Starting job process.\n")
+                log.flush()
                 with self.lock:
                     if self.closing:
                         return
                     child = subprocess.Popen(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
                     self.processes.add(child)
-                code = child.wait()
-                with self.lock:
-                    self.processes.discard(child)
+                try:
+                    code = child.wait()
+                finally:
+                    with self.lock:
+                        self.processes.discard(child)
             if code:
+                with (path / "job.log").open("a", encoding="utf-8") as log:
+                    log.write(f"Job process exited with code {code}.\n")
                 state = projects.read_project(path)
                 state.update(status="failed", error=state.get("error") or "Job failed. Open the job log for setup or input details.")
                 projects.save_project(path, state)
@@ -132,6 +148,8 @@ class Studio:
             state = projects.read_project(path)
             state.update(status="failed", error=str(exc))
             projects.save_project(path, state)
+            with (path / "job.log").open("a", encoding="utf-8") as log:
+                log.write(f"Could not start job process: {exc}\n")
 
     def close(self):
         with self.lock:

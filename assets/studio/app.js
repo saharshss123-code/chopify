@@ -409,7 +409,13 @@ function updateStatus(detail) {
     (errors.length ? `${errors.length} clip(s) failed to render.` : "");
   $("#job-error").hidden = !error;
   $("#job-error").textContent = error;
-  $("#log").textContent = detail.log || "No job has run yet.";
+  $("#log").textContent =
+    detail.log ||
+    (detail.busy
+      ? detail.project.status === "queued"
+        ? "Queued; waiting for the current job to start."
+        : "Job started; waiting for output."
+      : "No job has run yet.");
   state.busy = detail.busy;
   for (const selector of [
     "#prepare",

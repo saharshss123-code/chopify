@@ -439,7 +439,7 @@ projects/
     selection.json     # threshold, score range, counts, durations
     segments.json      # editable clip candidates (the render contract)
     embeddings.json    # optional semantic-search cache
-    job.log            # dashboard job output
+    job.log            # latest job's queue, startup, worker output, and errors
     discovery.m4a      # long-URL audio; discovery.mp4 when there is no audio or no speech
     source.mp4         # short-URL footage; local files stay in place
     sections/          # cached long-URL ranges, removed after final render

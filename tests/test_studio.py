@@ -328,6 +328,61 @@ def test_project_detail_section_projects_are_never_playable(tmp_path):
     assert not dashboard.project_detail(root, "abc123abc123")["playable_source"]
 
 
+def test_studio_queue_writes_log_before_starting_worker(tmp_path, monkeypatch):
+    import dashboard
+    import projects
+
+    root = tmp_path / "projects"
+    project = projects.create_project(root, "https://example.com/video", {})
+
+    class Process:
+        def wait(self):
+            return 0
+
+    def popen(_cmd, cwd, stdout, stderr):
+        stdout.write("worker output\n")
+        stdout.flush()
+        return Process()
+
+    monkeypatch.setattr(dashboard.subprocess, "Popen", popen)
+    studio = dashboard.Studio(root)
+    try:
+        studio.enqueue(project["id"], "prepare")
+        path = projects.project_path(root, project["id"])
+        assert "Queued prepare job." in (path / "job.log").read_text(
+            encoding="utf-8")
+        studio.futures[project["id"]].result(timeout=2)
+        log = (path / "job.log").read_text(encoding="utf-8")
+        assert "Starting job process." in log
+        assert "worker output" in log
+        assert not studio.busy(project["id"])
+    finally:
+        studio.close()
+
+
+def test_studio_queue_logs_process_start_errors(tmp_path, monkeypatch):
+    import dashboard
+    import projects
+
+    root = tmp_path / "projects"
+    project = projects.create_project(root, "https://example.com/video", {})
+
+    def fail_to_start(*_args, **_kwargs):
+        raise OSError("missing runtime")
+
+    monkeypatch.setattr(dashboard.subprocess, "Popen", fail_to_start)
+    studio = dashboard.Studio(root)
+    try:
+        studio.enqueue(project["id"], "prepare")
+        studio.futures[project["id"]].result(timeout=2)
+        path = projects.project_path(root, project["id"])
+        assert projects.read_project(path)["status"] == "failed"
+        assert "Could not start job process: missing runtime" in (
+            path / "job.log").read_text(encoding="utf-8")
+    finally:
+        studio.close()
+
+
 def test_settings_accept_null_cap_and_preferred_length():
     import projects
     options = projects.validate_options({
