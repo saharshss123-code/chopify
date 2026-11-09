@@ -67,6 +67,26 @@ def test_style_variants_never_overwrite_cached_outputs(tmp_path, monkeypatch):
     assert projects.run_project(path, action="render")["last_outputs"] == original
 
 
+def test_native_effect_options_are_passed_and_part_of_render_cache(tmp_path, monkeypatch):
+    path = ready_project(tmp_path)
+    monkeypatch.setattr(projects.render_clips, "ffprobe_dims", lambda p: (640, 360))
+    seen = []
+
+    def render(segment, *args, **kwargs):
+        seen.append((kwargs["overlay"], kwargs["sound_effect"]))
+        return fake_render(segment, *args, **kwargs)
+
+    monkeypatch.setattr(projects.render_clips, "render", render)
+    original = projects.run_project(path, action="render")["last_outputs"]
+    state = projects.read_project(path)
+    state["options"].update(overlay="pulse", sound_effect="ping")
+    projects.save_project(path, state)
+    changed = projects.run_project(path, action="render")["last_outputs"]
+    assert seen == [("none", "none"), ("none", "none"),
+                    ("pulse", "ping"), ("pulse", "ping")]
+    assert not set(original) & set(changed)
+
+
 def test_render_rejects_source_changed_since_transcription(tmp_path, monkeypatch):
     path = ready_project(tmp_path)
     state = projects.read_project(path)

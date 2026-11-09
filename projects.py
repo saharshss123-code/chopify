@@ -23,7 +23,8 @@ DEFAULT_OPTIONS = {"aspect": "16:9", "style": "default", "tighten": False,
                    "min_score": 8.0, "preferred_len": None,
                    "llm": None, "search": None, "semantic": None,
                    "embed_model": "nomic-embed-text", "brand": None,
-                   "layout": "single", "centers": [0.25, 0.75], "caption": None}
+                   "layout": "single", "centers": [0.25, 0.75], "caption": None,
+                   "overlay": "none", "sound_effect": "none"}
 
 
 def digest(value):
@@ -56,6 +57,10 @@ def validate_options(options):
         raise ValueError("Unknown aspect ratio or caption style.")
     if result["layout"] not in {"single", "split"}:
         raise ValueError("Layout must be single or split.")
+    if result["overlay"] not in {"none", "pulse"}:
+        raise ValueError("Overlay must be none or pulse.")
+    if result["sound_effect"] not in {"none", "ping"}:
+        raise ValueError("Sound effect must be none or ping.")
     if result["layout"] == "split" and result["aspect"] != "9:16":
         raise ValueError("Podcast split-screen requires aspect 9:16.")
     for key in ("min_len", "max_len"):
@@ -496,7 +501,9 @@ def run_project(path, action="all", preview=False, pick=None, resume=True, progr
                         options["aspect"], out_dir=out, style=options["style"],
                         do_tighten=options["tighten"], loudnorm=options["loudnorm"], preview=preview,
                         brand=brand, layout=options["layout"], centers=options["centers"],
-                        caption=options["caption"], source_offset=source_offset)
+                        caption=options["caption"], source_offset=source_offset,
+                        overlay=options["overlay"],
+                        sound_effect=options["sound_effect"])
                 except (Exception, SystemExit) as exc:
                     if not render_from_sections:
                         raise

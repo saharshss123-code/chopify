@@ -428,6 +428,40 @@ def ass_escape(s):
     return s.replace("\\", "").replace("{", "(").replace("}", ")")
 
 
+def _first_caption_time(words, clip_start, clip_end):
+    visible = [max(float(word["start"]), clip_start) - clip_start
+               for word in words
+               if not word.get("hidden")
+               and float(word["end"]) > clip_start
+               and float(word["start"]) < clip_end]
+    return max(0.0, min(visible)) if visible else None
+
+
+def _has_audio(source):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=index", "-of", "csv=p=0", str(source)],
+        capture_output=True, text=True, check=True)
+    return bool(result.stdout.strip())
+
+
+def _pulse_filters(cue_time, tw, th):
+    x = max(8, round(tw * 0.035))
+    y = max(8, round(th * 0.04))
+    height = max(4, round(th * 0.009))
+    widths = [max(14, round(tw * ratio))
+              for ratio in (0.012, 0.024, 0.036, 0.048, 0.036)]
+    filters = []
+    for i, width in enumerate(widths):
+        begin = cue_time + i * 0.08
+        end = begin + 0.08
+        enable = f"between(t\\,{begin:.3f}\\,{end:.3f})"
+        filters.append(
+            f"drawbox=x={x}:y={y}:w={width}:h={height}:"
+            f"color=0x56E0B0@0.95:t=fill:enable='{enable}'")
+    return ",".join(filters)
+
+
 def build_ass(words, clip_start, clip_end, path, tw, th, font_size, margin_v,
               style_name=DEFAULT_STYLE, brand=None, caption=None):
     st = resolve_caption(style_name, brand, caption)
@@ -596,7 +630,7 @@ def caption_from_args(args):
 def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAULT_STYLE,
            do_tighten=False, loudnorm=False, preview=False, brand=None,
            layout="single", centers=(0.25, 0.75), caption=None,
-           source_offset=0.0):
+           source_offset=0.0, overlay="none", sound_effect="none"):
     from captions import write_srt
     out_dir = (Path(out_dir) if out_dir else default_out()).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -606,6 +640,10 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
         raise ValueError("Split-screen requires vertical 9:16 output.")
     if len(centers) != 2 or any(not math.isfinite(v) or not 0 <= v <= 1 for v in centers):
         raise ValueError("Speaker centers must be between 0 and 1.")
+    if overlay not in {"none", "pulse"}:
+        raise ValueError("Overlay must be none or pulse.")
+    if sound_effect not in {"none", "ping"}:
+        raise ValueError("Sound effect must be none or ping.")
     full_w, full_h, font_size, margin_v = ASPECTS[aspect]
     if preview:
         # fast 480p-class draft: smaller frame, smaller captions, no poster/meta
@@ -640,6 +678,7 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
               f"{(end - start) - dur:.1f}s removed", flush=True)
         start = 0.0
         local_start = 0.0
+    cue_time = _first_caption_time(cap_words, start, start + dur)
     build_ass(cap_words, start, start + dur, out_dir / "_caption.ass",
               tw, th, font_size, margin_v, style, brand, caption)
 
@@ -669,26 +708,71 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
     suffix = ".preview" if preview else ""
     prefix = sanitize(str(seg["id"])) + "-" if seg.get("id") else ""
     out = out_dir / (prefix + sanitize(seg.get("hook", "clip")) + suffix + ".mp4")
-    cmd = ["ffmpeg", "-y", "-ss", f"{local_start:.3f}", "-i", str(render_src),
-           "-t", f"{dur:.3f}",
+    cmd = ["ffmpeg", "-y", "-ss", f"{local_start:.3f}", "-i", str(render_src)]
+    if brand and brand.get("logo"):
+        cmd += ["-i", brand["logo"]]
+    use_sfx = sound_effect == "ping" and cue_time is not None
+    source_has_audio = _has_audio(render_src) if use_sfx else False
+    silence_input = None
+    if use_sfx:
+        if not source_has_audio:
+            silence_input = 1 + int(bool(brand and brand.get("logo")))
+            cmd += ["-f", "lavfi", "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        cmd += ["-f", "lavfi", "-i",
+                "sine=frequency=880:sample_rate=48000:duration=0.20"]
+    cmd += ["-t", f"{dur:.3f}",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(out)]
-    if brand and brand.get("logo"):
-        width = max(20, round(brand["logo_width"] * tw / 1920))
-        if layout == "single":
-            vf = "[0:v]" + vf
-        graph = (vf + f"[captioned];[1:v]scale={width}:-1[logo];"
-                 "[captioned][logo]overlay=W-w-24:24:eof_action=repeat[v]")
-        pos = cmd.index("-t")
-        cmd[pos:pos] = ["-i", brand["logo"]]
-        cmd[cmd.index("-c:v"):cmd.index("-c:v")] = ["-filter_complex", graph, "-map", "[v]", "-map", "0:a?"]
-    elif layout == "split":
-        cmd[cmd.index("-c:v"):cmd.index("-c:v")] = ["-filter_complex", vf + "[v]", "-map", "[v]", "-map", "0:a?"]
+
+    graph_mode = bool((brand and brand.get("logo")) or layout == "split"
+                      or (overlay == "pulse" and cue_time is not None)
+                      or use_sfx)
+    if graph_mode:
+        graph = vf if layout == "split" else "[0:v]" + vf
+        if overlay == "pulse" and cue_time is not None:
+            graph += "," + _pulse_filters(cue_time, tw, th)
+        if brand and brand.get("logo"):
+            width = max(20, round(brand["logo_width"] * tw / 1920))
+            graph += (f"[captioned];[1:v]scale={width}:-1[logo];"
+                      "[captioned][logo]overlay=W-w-24:24:eof_action=repeat[v]")
+        else:
+            graph += "[v]"
+        cmd[cmd.index("-c:v"):cmd.index("-c:v")] = [
+            "-filter_complex", graph, "-map", "[v]"]
     else:
         cmd[cmd.index("-c:v"):cmd.index("-c:v")] = ["-vf", vf]
-    if loudnorm:
+
+    if use_sfx:
+        tone_index = 1 + int(bool(brand and brand.get("logo")))
+        if not source_has_audio:
+            tone_index += 1
+        if silence_input is not None:
+            base_audio = (f"[{silence_input}:a]atrim=duration={dur:.3f},"
+                          "asetpts=PTS-STARTPTS[base]")
+        else:
+            base_filter = ("loudnorm=I=-14:TP=-1.5:LRA=11"
+                           if loudnorm else "anull")
+            base_audio = (f"[0:a:0]asetpts=PTS-STARTPTS,"
+                          f"{base_filter}[base]")
+        delay_ms = max(0, round(cue_time * 1000))
+        audio_graph = (
+            base_audio + ";"
+            f"[{tone_index}:a]volume='0.18*exp(-12*t)',"
+            "afade=t=in:st=0:d=0.005,afade=t=out:st=0.08:d=0.12,"
+            f"adelay={delay_ms}:all=1[sfx];"
+            "[base][sfx]amix=inputs=2:duration=first:"
+            "dropout_transition=0:normalize=0[audio_out]")
+        graph_arg = cmd[cmd.index("-filter_complex") + 1]
+        cmd[cmd.index("-filter_complex") + 1] = graph_arg + ";" + audio_graph
+        cmd[cmd.index("-c:v"):cmd.index("-c:v")] = [
+            "-map", "[audio_out]"]
+    elif loudnorm:
         cmd[cmd.index("-c:v"):cmd.index("-c:v")] = [
             "-af", "loudnorm=I=-14:TP=-1.5:LRA=11"]
+
+    if graph_mode and not use_sfx:
+        cmd[cmd.index("-c:v"):cmd.index("-c:v")] = ["-map", "0:a?"]
     print(">", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True, cwd=str(out_dir))
     write_srt(cap_words, start, start + dur, out.with_suffix(".srt"),

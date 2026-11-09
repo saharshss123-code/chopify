@@ -20,7 +20,9 @@ clips. All transcription, scoring, editing, and rendering run on your computer.
 6. Change titles, start/end times, and selected checkboxes. Save clip edits.
 7. Open **Captions**, choose a look, tune it, and **Save caption style**. Use
    **Preview 5s** to check motion over a selected range.
-8. Save settings, then **Preview selected** to render small drafts.
+8. Optionally select a **Cue pulse** overlay and/or a soft ping synchronized
+   to the first visible caption. Save settings, then **Preview selected** to
+   render small drafts; the source audio remains in the mix.
 9. **Export selected** creates MP4 + SRT + PNG poster + metadata JSON.
 
 Jobs execute serially to avoid simultaneous model/encoder contention. You can add

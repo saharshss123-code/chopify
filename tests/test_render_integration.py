@@ -1,5 +1,7 @@
 """Actual ffmpeg renders catch filtergraph, codec, path and subtitle regressions."""
 import json
+import math
+import struct
 import shutil
 import subprocess
 from pathlib import Path
@@ -97,6 +99,41 @@ def test_boxed_pop_caption_render_and_matching_srt_groups(source, tmp_path):
     assert srt.count("-->") == 2
     assert "skip" not in srt
     assert "Hello world!" in srt
+
+
+def test_pulse_and_ping_render_at_first_visible_caption_without_replacing_audio(source, tmp_path):
+    words = [{"word": "hidden", "start": 0.6, "end": 0.8, "hidden": True},
+             {"word": "Hello", "start": 1.2, "end": 1.5}]
+    out = render_clips.render(
+        {"id": "fx", "start": 0.5, "end": 2.5, "hook": "cue"},
+        words, source, 640, 360, tmp_path, "16:9",
+        out_dir=tmp_path / "effects", preview=True, overlay="pulse",
+        sound_effect="ping")
+    streams = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(out)],
+        capture_output=True, text=True, check=True).stdout)["streams"]
+    assert {stream["codec_name"] for stream in streams} >= {"h264", "aac"}
+
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(out), "-ac", "1", "-ar", "48000",
+         "-f", "f32le", "-"],
+        capture_output=True, check=True).stdout
+    samples = struct.unpack(f"<{len(raw) // 4}f", raw)
+
+    def tone_amplitude(frequency, start, duration=0.08):
+        begin = round(start * 48000)
+        count = round(duration * 48000)
+        values = samples[begin:begin + count]
+        real = sum(value * math.cos(2 * math.pi * frequency * i / 48000)
+                   for i, value in enumerate(values))
+        imag = sum(value * math.sin(2 * math.pi * frequency * i / 48000)
+                   for i, value in enumerate(values))
+        return 2 * math.hypot(real, imag) / len(values)
+
+    # The first visible caption is 0.7s into the clip. The ping is audible
+    # immediately after that cue, while the original 440Hz track remains.
+    assert tone_amplitude(880, 0.72) > tone_amplitude(880, 0.2) * 3
+    assert tone_amplitude(440, 0.2) > 0.02
 
 
 def test_cli_render_preserves_project_settings_and_copies_exports(source, tmp_path):

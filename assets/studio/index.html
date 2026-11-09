@@ -385,6 +385,22 @@
                 ><input name="loudnorm" type="checkbox" /> Normalize audio
                 loudness</label
               >
+              <label
+                >Animated overlay<select name="overlay">
+                  <option value="none">None</option>
+                  <option value="pulse">Cue pulse</option>
+                </select></label
+              >
+              <label
+                >Synchronized sound effect<select name="sound_effect">
+                  <option value="none">None</option>
+                  <option value="ping">Soft ping at first caption</option>
+                </select></label
+              >
+              <p class="hint">
+                When enabled, the pulse and soft ping sync to the first visible
+                caption. Your original audio stays in the mix.
+              </p>
               <button class="wide" type="submit">Save settings</button>
             </form>
             <details class="caption-details" open>

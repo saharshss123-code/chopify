@@ -176,6 +176,51 @@ class TestProjectOptions:
         assert options["max_clips"] is None
         assert options["min_score"] == 8.0
         assert options["preferred_len"] is None
+        assert options["overlay"] == "none"
+        assert options["sound_effect"] == "none"
+
+    @pytest.mark.parametrize("key,value", [
+        ("overlay", "strobe"),
+        ("sound_effect", "explosion"),
+    ])
+    def test_unknown_native_render_effects_rejected(self, key, value):
+        import projects
+        with pytest.raises(ValueError):
+            projects.validate_options({key: value})
+
+    @pytest.mark.parametrize(
+        "has_audio,expected_base,tone_input",
+        [(True, "[0:a:0]", "[1:a]"), (False, "[1:a]", "[2:a]")],
+    )
+    def test_native_effect_filter_graph_uses_caption_cue_and_keeps_source_audio(
+            self, tmp_path, monkeypatch, has_audio, expected_base, tone_input):
+        import render_clips
+
+        source = tmp_path / "source.mp4"
+        source.write_bytes(b"fixture")
+        monkeypatch.setattr(render_clips, "_has_audio", lambda _: has_audio)
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+
+        monkeypatch.setattr(render_clips.subprocess, "run", fake_run)
+        render_clips.render(
+            {"id": "test", "start": 0.5, "end": 2.5, "hook": "cue"},
+            [{"word": "ignored", "start": 0.6, "end": 0.8, "hidden": True},
+             {"word": "first", "start": 1.25, "end": 1.5}],
+            source, 640, 360, tmp_path, "16:9",
+            out_dir=tmp_path / "output", preview=True, overlay="pulse",
+            sound_effect="ping")
+        command = calls[0]
+        graph = command[command.index("-filter_complex") + 1]
+        assert expected_base in graph
+        assert tone_input in graph
+        assert "adelay=750:all=1" in graph
+        assert "drawbox=" in graph
+        maps = [command[i + 1] for i, value in enumerate(command[:-1])
+                if value == "-map"]
+        assert maps == ["[v]", "[audio_out]"]
 
     def test_none_cap_and_null_score_are_accepted(self):
         import projects
