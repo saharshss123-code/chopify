@@ -49,6 +49,14 @@ Try `--whisper-model small` or `tiny` and `--device cpu`. faster-whisper GPU
 acceleration requires compatible NVIDIA/CUDA; AMD systems can use CPU. Studio
 executes jobs serially to avoid loading multiple speech models at once.
 
+If transcription fails with `av.open() got an unexpected keyword argument
+'metadata_errors'`, install a compatible PyAV version in the same virtual
+environment as Chopify and restart Studio:
+
+```powershell
+.venv\Scripts\python -m pip install "av>=11,<19"
+```
+
 ## Captions have missing glyphs or wrong timing
 
 Choose an installed font with the language's glyphs. Review word times in Studio
