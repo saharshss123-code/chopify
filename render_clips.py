@@ -758,7 +758,7 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
         delay_ms = max(0, round(cue_time * 1000))
         audio_graph = (
             base_audio + ";"
-            f"[{tone_index}:a]volume='0.18*exp(-12*t)',"
+            f"[{tone_index}:a]volume=0.18,"
             "afade=t=in:st=0:d=0.005,afade=t=out:st=0.08:d=0.12,"
             f"adelay={delay_ms}:all=1[sfx];"
             "[base][sfx]amix=inputs=2:duration=first:"
