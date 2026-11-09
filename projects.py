@@ -17,14 +17,15 @@ import sections
 import branding
 from captions import update_transcript
 
-DEFAULT_OPTIONS = {"aspect": "16:9", "style": "default", "tighten": False,
+DEFAULT_OPTIONS = {"aspect": "9:16", "style": "default", "tighten": False,
                    "loudnorm": False, "whisper_model": "medium", "device": "cpu",
-                   "min_len": 15, "max_len": 300, "max_clips": None,
+                   "min_len": 15, "max_len": 90, "max_clips": None,
                    "min_score": 8.0, "preferred_len": None,
                    "llm": None, "search": None, "semantic": None,
                    "embed_model": "nomic-embed-text", "brand": None,
-                   "layout": "single", "centers": [0.25, 0.75], "caption": None,
+                   "layout": "auto", "centers": [0.25, 0.75], "caption": None,
                    "overlay": "none", "sound_effect": "none"}
+SCORING_VERSION = 2
 
 
 def digest(value):
@@ -55,8 +56,8 @@ def validate_options(options):
     result = {**DEFAULT_OPTIONS, **options}
     if result["aspect"] not in render_clips.ASPECTS or result["style"] not in render_clips.CAPTION_STYLES:
         raise ValueError("Unknown aspect ratio or caption style.")
-    if result["layout"] not in {"single", "split"}:
-        raise ValueError("Layout must be single or split.")
+    if result["layout"] not in {"auto", "single", "split", "blur-fit"}:
+        raise ValueError("Layout must be auto, single, split or blur-fit.")
     if result["overlay"] not in {"none", "pulse"}:
         raise ValueError("Overlay must be none or pulse.")
     if result["sound_effect"] not in {"none", "ping"}:
@@ -112,7 +113,7 @@ def score_keys(transcript_key, data, options):
     discovery_options = {key: options[key] for key in (
         "search", "semantic", "embed_model", "min_len", "max_len",
         "preferred_len")}
-    discovery_key = digest([transcript_key, data, discovery_options,
+    discovery_key = digest([SCORING_VERSION, transcript_key, data, discovery_options,
                             evidence.EVIDENCE_VERSION,
                             visual.FEATURE_VERSION])
     selection_options = {key: options[key] for key in (
@@ -503,10 +504,11 @@ def run_project(path, action="all", preview=False, pick=None, resume=True, progr
                         brand=brand, layout=options["layout"], centers=options["centers"],
                         caption=options["caption"], source_offset=source_offset,
                         overlay=options["overlay"],
-                        sound_effect=options["sound_effect"])
+                        sound_effect=options["sound_effect"],
+                        source_meta=state.get("source_meta") or {},
+                        content_profile=(state.get("selection") or {}).get(
+                            "content_profile", "mixed"))
                 except (Exception, SystemExit) as exc:
-                    if not render_from_sections:
-                        raise
                     render_errors.append(
                         {"clip": segment["id"], "error": str(exc)})
                     save_project(path, state)
@@ -519,7 +521,8 @@ def run_project(path, action="all", preview=False, pick=None, resume=True, progr
                 message = f"{len(render_errors)} clip(s) failed to render."
                 if not outputs:
                     raise ValueError(message + " Sections stay cached for retry.")
-                state.update(status="failed", stage="render incomplete",
+                state.update(status="complete_with_errors",
+                             stage="render complete with errors",
                              error=message + " Successful clips were kept.")
                 save_project(path, state)
                 return state

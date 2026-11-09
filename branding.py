@@ -47,13 +47,15 @@ CAPTION_ENUMS = {
     "highlight_mode": {"word", "karaoke", "none"},
 }
 
-# Brand presets keep the original defaults so existing files render exactly the
-# same, then gain the new caption fields as opt-in overrides. None means the
-# brand file did not set that field, so the named preset supplies it.
+# Brand presets only override caption fields explicitly present in the file.
+# None means the selected style preset supplies the value.
 DEFAULTS = {
     **CAPTION_DEFAULTS,
-    "font_size": 72,
-    "margin": 95,
+    "font": None,
+    "color": None,
+    "highlight": None,
+    "font_size": None,
+    "margin": None,
     "logo": None,
     "logo_width": 180,
 }

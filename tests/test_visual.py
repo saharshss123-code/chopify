@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 import visual
+import render_clips
 
 
 def flat_frames(count=6):
@@ -206,3 +207,27 @@ def test_refine_media_boundary_snaps_to_motion_onset():
 def test_refine_media_boundary_keeps_range_without_evidence():
     assert visual.refine_media_boundary(
         None, None, 5.0, 15.0, 5.0, 20.0) == (5.0, 15.0)
+
+
+def test_auto_layout_uses_blur_fit_when_faces_are_rare():
+    frames = [(index / 2, []) for index in range(10)]
+    layout, centers = render_clips.automatic_layout(
+        {"frames": frames, "face_share": 0.2}, 1920, 608)
+    assert layout == "blur-fit"
+    assert centers == (0.25, 0.75)
+
+
+def test_auto_layout_splits_sustained_distant_faces():
+    frames = [(index / 2, [300.0, 1500.0]) for index in range(10)]
+    layout, centers = render_clips.automatic_layout(
+        {"frames": frames, "face_share": 0.8}, 1920, 608)
+    assert layout == "split"
+    assert centers == pytest.approx((300 / 1920, 1500 / 1920))
+
+
+def test_auto_layout_tracks_close_or_brief_face_pairs():
+    frames = [(index / 2, [300.0, 1500.0] if index == 0 else [900.0])
+              for index in range(10)]
+    layout, _ = render_clips.automatic_layout(
+        {"frames": frames, "face_share": 0.8}, 1920, 608)
+    assert layout == "single"

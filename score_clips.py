@@ -28,6 +28,7 @@ import json
 import bisect
 import hashlib
 import argparse
+import os
 import urllib.request
 from pathlib import Path
 
@@ -42,6 +43,12 @@ BLOCK_VERSION = 1
 
 BASE_LADDER = (15, 30, 45, 60, 90, 120, 180, 300)
 DURATION_HELP = "Use seconds or a duration like 45s, 2m, or 1m30s (5s to 1h)."
+SCORING_VERSION = 2
+PLATFORM_PRESETS = {
+    "reels": {"max_len": 90, "preferred_len": 45},
+    "shorts": {"max_len": 60, "preferred_len": 45},
+    "tiktok": {"max_len": 180, "preferred_len": 60},
+}
 
 
 def parse_duration(value):
@@ -364,8 +371,10 @@ def _span_sum(index, key, a, b):
 class WindowIndex:
     """Per-sentence features plus fast window scoring."""
 
-    def __init__(self, sentences, source_wps=None):
+    def __init__(self, sentences, source_wps=None, language="en"):
         self.sentences = sentences
+        self.english = (not language or str(language).lower().split("-")[0]
+                        in {"en", "english"})
         self.features = [sentence_features(sent) for sent in sentences]
         self.prefix = build_prefix_sums(self.features)
         rates = sorted(f["wps"] for f in self.features if f["words"])
@@ -392,64 +401,82 @@ def _score_indexed(index, a, b):
     total_words = _span_sum(index, "words", a, b)
     wps = total_words / duration
 
-    hook_cues = (_span_sum(index, "hook", a, min(b, a + 1))
-                 + first["curiosity"] + first["stakes"]
-                 + first["superlative"] + first["negation"])
-    hook = (0.45 * min(1.0, hook_cues / 4.0)
-            + 0.15 * first["question"] + 0.10 * first["number"]
-            + 0.10 * first["second_person"]
-            + 0.10 * min(1.0, first["curiosity"] / 2.0)
-            + 0.10 * min(1.0, first["stakes"] / 2.0))
-    if first["meta_open"]:
-        hook -= 0.25
-    hook = clamp01(hook)
+    if index.english:
+        hook_cues = (_span_sum(index, "hook", a, min(b, a + 1))
+                     + first["curiosity"] + first["stakes"]
+                     + first["superlative"] + first["negation"])
+        hook = (0.45 * min(1.0, hook_cues / 4.0)
+                + 0.15 * first["question"] + 0.10 * first["number"]
+                + 0.10 * first["second_person"]
+                + 0.10 * min(1.0, first["curiosity"] / 2.0)
+                + 0.10 * min(1.0, first["stakes"] / 2.0))
+        if first["meta_open"]:
+            hook -= 0.25
+        hook = clamp01(hook)
+    else:
+        hook = 0.0
 
     first_tokens = set(first["tokens"]) - STOPWORDS
     last_tokens = set(last["tokens"]) - STOPWORDS
     overlap = 1.0 if first_tokens & last_tokens else 0.0
-    payoff_cues = _span_sum(index, "payoff_cue", max(a, b - 1), b)
-    payoff = (0.35 * last["terminal"]
-              + 0.25 * min(1.0, payoff_cues / 2.0)
-              + 0.20 * overlap
-              + 0.20 * (1.0 - min(1.0, last["filler_ratio"] * 3.0)))
-    payoff = clamp01(payoff)
+    if index.english:
+        payoff_cues = _span_sum(index, "payoff_cue", max(a, b - 1), b)
+        payoff = (0.35 * last["terminal"]
+                  + 0.25 * min(1.0, payoff_cues / 2.0)
+                  + 0.20 * overlap
+                  + 0.20 * (1.0 - min(1.0, last["filler_ratio"] * 3.0)))
+        payoff = clamp01(payoff)
+    else:
+        payoff = float(last["terminal"])
 
-    start_clean = not first["anaphoric"] and not first["meta_open"]
-    no_earlier = _span_sum(index, "earlier_ref", a, b) == 0
+    start_clean = (not first["anaphoric"] and not first["meta_open"]
+                   if index.english else True)
+    no_earlier = (_span_sum(index, "earlier_ref", a, b) == 0
+                  if index.english else True)
     self_containment = (0.35 * start_clean + 0.25 * no_earlier
                         + 0.20 * last["terminal"] + 0.20)
     self_containment = clamp01(self_containment)
 
     halfway = a + max(1, (b - a + 1) // 2)
-    tension = (_span_sum(index, "stakes", a, halfway - 1)
-               + _span_sum(index, "emotion", a, halfway - 1)
-               + _span_sum(index, "controversy", a, halfway - 1)) > 0
-    resolution = _span_sum(index, "payoff_cue", halfway, b) > 0
-    arc = (0.30 * (len(features) >= 2) + 0.30 * last["terminal"]
-           + 0.40 * (tension and resolution))
+    if index.english:
+        tension = (_span_sum(index, "stakes", a, halfway - 1)
+                   + _span_sum(index, "emotion", a, halfway - 1)
+                   + _span_sum(index, "controversy", a, halfway - 1)) > 0
+        resolution = _span_sum(index, "payoff_cue", halfway, b) > 0
+        arc = (0.30 * (len(features) >= 2) + 0.30 * last["terminal"]
+               + 0.40 * (tension and resolution))
+    else:
+        arc = (0.30 * (len(features) >= 2) + 0.70 * last["terminal"])
     arc = clamp01(arc)
 
     rate = clamp01((wps / max(0.5, index.source_wps)) / 1.35)
-    marks = min(1.0, (_span_sum(index, "exclamation", a, b)
-                      + _span_sum(index, "caps", a, b)
-                      + _span_sum(index, "repeated", a, b)
-                      + _span_sum(index, "intensity", a, b)
-                      + _span_sum(index, "laughter", a, b)
-                      + _span_sum(index, "game_cue", a, b)) / 3.0)
+    marks = (min(1.0, (_span_sum(index, "exclamation", a, b)
+                       + _span_sum(index, "caps", a, b)
+                       + _span_sum(index, "repeated", a, b)
+                       + _span_sum(index, "intensity", a, b)
+                       + _span_sum(index, "laughter", a, b)
+                       + _span_sum(index, "game_cue", a, b)) / 3.0)
+             if index.english else 0.0)
     onset = clamp01(first["wps"] / 3.5)
-    energy = clamp01(0.50 * rate + 0.30 * marks + 0.20 * onset)
+    energy = (clamp01(0.50 * rate + 0.30 * marks + 0.20 * onset)
+              if index.english else clamp01(0.75 * rate + 0.25 * onset))
 
-    quotability = max(feature["quotability"] for feature in features)
-    emotion_hits = (_span_sum(index, "emotion", a, b)
-                    + _span_sum(index, "reaction", a, b)
-                    + _span_sum(index, "personal_stakes", a, b))
-    emotion = clamp01(emotion_hits / 3.0)
-    controversy = clamp01(_span_sum(index, "controversy", a, b) / 2.0)
-    humour = clamp01(_span_sum(index, "humour", a, b) / 2.0)
+    if index.english:
+        quotability = max(feature["quotability"] for feature in features)
+        emotion_hits = (_span_sum(index, "emotion", a, b)
+                        + _span_sum(index, "reaction", a, b)
+                        + _span_sum(index, "personal_stakes", a, b))
+        emotion = clamp01(emotion_hits / 3.0)
+        controversy = clamp01(_span_sum(index, "controversy", a, b) / 2.0)
+        humour = clamp01(_span_sum(index, "humour", a, b) / 2.0)
+    else:
+        quotability = emotion = controversy = humour = 0.0
 
-    total_filler = _span_sum(index, "filler_count", a, b)
+    total_filler = (_span_sum(index, "filler_count", a, b)
+                    if index.english else 0)
     filler_penalty = min(0.08, (total_filler / max(1, total_words)) * 0.6)
-    meta_penalty = 0.15 if first["meta_open"] or last["meta_outro"] else 0.0
+    meta_penalty = (0.15 if first["meta_open"] or last["meta_outro"] else 0.0) \
+        if index.english else 0.0
     repeat_penalty = 0.05 if (_span_sum(index, "repeated_bigram", a, b)
                               + _span_sum(index, "false_start", a, b)) else 0.0
     silence_penalty = min(0.08, max(0.0, max(
@@ -471,7 +498,12 @@ def _score_indexed(index, a, b):
         "quotability": round(quotability, 3), "emotion": round(emotion, 3),
         "controversy": round(controversy, 3), "humour": round(humour, 3),
     }
-    weighted = sum(TEXT_WEIGHTS[key] * value for key, value in parts.items())
+    weights = (TEXT_WEIGHTS if index.english else {
+        "hook": 0.0, "payoff": 0.10, "self_containment": 0.25,
+        "arc": 0.25, "energy": 0.40, "quotability": 0.0,
+        "emotion": 0.0, "controversy": 0.0, "humour": 0.0,
+    })
+    weighted = sum(weights[key] * value for key, value in parts.items())
     raw_score = clamp01(weighted - penalties)
     text_score = calibrate_text(raw_score)
     parts["penalties"] = round(penalties, 3)
@@ -479,9 +511,9 @@ def _score_indexed(index, a, b):
     return parts, text_score, round(raw_score, 3)
 
 
-def score_window(sentences, a, b, source_wps=None, index=None):
+def score_window(sentences, a, b, source_wps=None, index=None, language="en"):
     """Score sentences[a..b]. Return (parts, text_score, raw_score)."""
-    index = index or WindowIndex(sentences, source_wps)
+    index = index or WindowIndex(sentences, source_wps, language)
     return index.score(a, b)
 
 
@@ -659,9 +691,9 @@ def discover_media_candidates(timeline, min_len, max_len, preferred_len=None,
     return candidates, stats
 
 
-def discover_candidates(sentences, min_len=15, max_len=300,
+def discover_candidates(sentences, min_len=15, max_len=90,
                         preferred_len=None, band=(30, 120),
-                        seed_indices=None, progress=None):
+                        seed_indices=None, progress=None, language="en"):
     """Evaluate every seed against the duration ladder.
 
     Returns (start-sorted candidates, stats). No threshold is applied here.
@@ -674,7 +706,7 @@ def discover_candidates(sentences, min_len=15, max_len=300,
         return [], empty_stats
 
     ladder = duration_ladder(min_len, max_len, preferred_len)
-    index = WindowIndex(sentences)
+    index = WindowIndex(sentences, language=language)
     seeds = normalize_seed_indices(sentences, seed_indices)
     ends = [float(sentence_["end"]) for sentence_ in sentences]
     last_index = len(sentences) - 1
@@ -743,11 +775,11 @@ def _transcript_identity(workdir):
     return digest.hexdigest()
 
 
-def _block_key(identity, min_len, max_len, preferred_len, band):
+def _block_key(identity, min_len, max_len, preferred_len, band, language):
     return hashlib.sha256(json.dumps([
-        BLOCK_VERSION, identity, float(min_len), float(max_len),
+        BLOCK_VERSION, SCORING_VERSION, identity, float(min_len), float(max_len),
         None if preferred_len is None else float(preferred_len),
-        list(band), evidence.EVIDENCE_VERSION, visual.FEATURE_VERSION,
+        list(band), language, evidence.EVIDENCE_VERSION, visual.FEATURE_VERSION,
     ]).encode("utf-8")).hexdigest()
 
 
@@ -770,7 +802,7 @@ def _block_part_matches(part, scan_key, index, start, end):
 
 def discover_blocks(sentences, min_len, max_len, preferred_len=None,
                     band=(30, 120), duration=None, workdir=None,
-                    progress=None):
+                    progress=None, language="en"):
     """Scan 30-minute ownership blocks and merge candidates in source order.
 
     Each block owns seeds starting inside it, while reading up to ``max_len``
@@ -789,7 +821,8 @@ def discover_blocks(sentences, min_len, max_len, preferred_len=None,
         duration if duration is not None else sentences[-1]["end"])
     starts = [float(item["start"]) for item in sentences]
     identity = _transcript_identity(workdir)
-    scan_key = _block_key(identity, min_len, max_len, preferred_len, band)
+    scan_key = _block_key(identity, min_len, max_len, preferred_len, band,
+                          language)
 
     bounds = []
     position = 0.0
@@ -819,7 +852,7 @@ def discover_blocks(sentences, min_len, max_len, preferred_len=None,
             local, part_stats = discover_candidates(
                 sentences[first:context_end], min_len, max_len,
                 preferred_len=preferred_len, band=band,
-                seed_indices=list(range(owned_count)))
+                seed_indices=list(range(owned_count)), language=language)
             for item in local:
                 if item.get("seed_index") is not None:
                     item["seed_index"] += first
@@ -956,11 +989,18 @@ def select_candidates(candidates, min_score=8.0, max_clips=None,
     records = dedupe_candidates(candidates, preferred_len, band, min_score) \
         if dedupe else [_validated_candidate(item) for item in candidates]
     passing = [item for item in records if item["overall"] >= min_score]
+    low_confidence = not passing and bool(records)
+    selected = passing if passing else sorted(
+        records, key=lambda item: (
+            -item["overall"], item["start"], item["duration"]))[:5]
     if max_clips is not None:
-        passing = sorted(passing, key=lambda item: (
+        selected = sorted(selected, key=lambda item: (
             -item["overall"], item["start"], item["duration"]))[:max_clips]
 
-    public = [_public_segment(item) for item in passing]
+    public = [_public_segment(item) for item in selected]
+    if low_confidence:
+        for segment in public:
+            segment["low_confidence"] = True
     ranked = sorted(public, key=lambda item: (
         -item["overall"], item["start"], item["duration"]))
     for rank, segment in enumerate(ranked, 1):
@@ -971,6 +1011,8 @@ def select_candidates(candidates, min_score=8.0, max_clips=None,
         record = {key: segment[key] for key in PUBLIC_SEGMENT_KEYS}
         if "evidence" in segment:
             record["evidence"] = segment["evidence"]
+        if segment.get("low_confidence"):
+            record["low_confidence"] = True
         segments.append(record)
 
     if evidence_available is None:
@@ -995,6 +1037,8 @@ def select_candidates(candidates, min_score=8.0, max_clips=None,
         "windows_scanned": discovery.get("windows_scanned", 0),
         "candidates": len(records),
         "passing": len(passing),
+        "selected": len(segments),
+        "low_confidence": low_confidence,
         "score_min": min(scores) if scores else None,
         "score_max": max(scores) if scores else None,
         "passing_score_min": min(passing_scores) if passing_scores else None,
@@ -1005,6 +1049,7 @@ def select_candidates(candidates, min_score=8.0, max_clips=None,
         "preferred_len": preferred_len,
         "analysis_floor": min(8.0, min_score),
         "content_profile": discovery.get("content_profile", "mixed"),
+        "language": discovery.get("language"),
         "source_energy": discovery.get("source_energy", 0.5),
         "evidence_available": availability,
         "visual_baseline": discovery.get("visual_baseline"),
@@ -1032,6 +1077,7 @@ def save_candidates(workdir, candidates, stats, mode="heuristic"):
         "version": CANDIDATES_VERSION,
         "mode": mode,
         "content_profile": stats.get("content_profile", "mixed"),
+        "language": stats.get("language"),
         "source_energy": stats.get("source_energy", 0.5),
         "source_duration": stats.get("source_duration"),
         "seeds": stats.get("seeds", 0),
@@ -1059,7 +1105,7 @@ def load_candidates(workdir):
     if not isinstance(data, dict) or not isinstance(data.get("candidates"), list):
         raise SystemExit("candidates.json is missing a candidate list.")
     stats = {key: data.get(key) for key in
-             ("source_duration", "content_profile", "source_energy", "seeds",
+             ("source_duration", "content_profile", "language", "source_energy", "seeds",
               "windows_scanned", "mode", "evidence_available",
               "visual_baseline", "visual_ranges", "visual_sections",
               "warnings")}
@@ -1223,6 +1269,12 @@ def format_selection_summary(stats):
     else:
         lines.append(f"Candidate scores {low:.1f}-{high:.1f}. {passing} distinct "
                      f"clips at {min_score:.1f} or above.")
+    if stats.get("low_confidence"):
+        lines.append(
+            f"No candidates met the threshold; showing {int(stats.get('selected') or 0)} "
+            "low-confidence option(s).")
+    if stats.get("llm_status") == "failed":
+        lines.append("Optional LLM reranking failed; deterministic scores are shown.")
     return "\n".join(lines)
 
 
@@ -1257,16 +1309,36 @@ RERANK_SYSTEM = (
     "You are a short-form video editor reviewing candidate clips. "
     "For each candidate, return a score adjustment between -1.0 and 1.0. "
     "Positive means stronger viral potential; negative means weaker. "
-    "Never change timestamps. Respond with JSON only: "
-    '[{"index": <int>, "adjustment": <-1..1>, "reason": "<short reason>"}]'
+    "Judge each candidate in its original language. Never change timestamps. "
+    'Return the required JSON object with a "results" array.'
 )
+RERANK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "adjustment": {"type": "number", "minimum": -1, "maximum": 1},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "adjustment", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["results"],
+    "additionalProperties": False,
+}
 
 
 def _ollama_chat(model, host, messages, timeout=120):
     """POST to the local Ollama chat endpoint and return parsed JSON content."""
     payload = {
-        "model": model, "stream": False, "format": "json",
-        "options": {"temperature": 0.2},
+        "model": model, "stream": False, "format": RERANK_SCHEMA,
+        "options": {"temperature": 0.2, "num_ctx": 8192},
         "messages": messages,
     }
     request = urllib.request.Request(
@@ -1276,8 +1348,36 @@ def _ollama_chat(model, host, messages, timeout=120):
     with urllib.request.urlopen(request, timeout=timeout) as response:
         content = json.loads(response.read().decode("utf-8")).get(
             "message", {}).get("content", "")
-    match = re.search(r"\[.*\]", content, re.S)
-    return json.loads(match.group(0)) if match else []
+    return json.loads(content)
+
+
+def _hosted_chat(url, model, api_key, messages, timeout=120):
+    """POST to an explicitly configured OpenAI-compatible hosted endpoint."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 4096,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "clip_rerank",
+                "strict": True,
+                "schema": RERANK_SCHEMA,
+            },
+        },
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    request = urllib.request.Request(
+        url.rstrip("/") + "/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    content = result["choices"][0]["message"]["content"]
+    return json.loads(content) if isinstance(content, str) else content
 
 
 def _candidate_key(candidate):
@@ -1286,45 +1386,61 @@ def _candidate_key(candidate):
             candidate.get("seed_index"))
 
 
-def ollama_rerank(candidates, model, host=OLLAMA_HOST, timeout=120):
-    """Adjust the top 50 deduped candidates by -1.0..+1.0.
+def _valid_rerank_results(raw, count):
+    if not isinstance(raw, dict) or set(raw) != {"results"}:
+        return None
+    results = raw["results"]
+    if not isinstance(results, list) or not results:
+        return None
+    validated = []
+    seen = set()
+    for entry in results:
+        if not isinstance(entry, dict) or set(entry) != {
+                "index", "adjustment", "reason"}:
+            return None
+        index, adjustment, reason = (
+            entry["index"], entry["adjustment"], entry["reason"])
+        if (isinstance(index, bool) or not isinstance(index, int)
+                or not 0 <= index < count or index in seen
+                or isinstance(adjustment, bool)
+                or not isinstance(adjustment, (int, float))
+                or not math.isfinite(adjustment)
+                or not -1.0 <= adjustment <= 1.0
+                or not isinstance(reason, str)):
+            return None
+        seen.add(index)
+        validated.append((index, float(adjustment), reason[:120]))
+    return validated
 
-    Returns an updated list, or None when Ollama is unavailable or returns junk.
-    Timestamps are never changed.
-    """
+
+def _rerank_batches(candidates, send_batch, model, provider):
     if not candidates:
         return None
     ranked = sorted(candidates, key=lambda item: (
         -item["overall"], item["start"], item["duration"]))[:50]
-    sent = [{"index": i, "start": item["start"], "end": item["end"],
-             "text": str(item.get("text", ""))[:400]}
-            for i, item in enumerate(ranked)]
-    messages = [
-        {"role": "system", "content": RERANK_SYSTEM},
-        {"role": "user", "content": json.dumps(sent, ensure_ascii=False)},
-    ]
-    try:
-        raw = _ollama_chat(model, host, messages, timeout)
-    except Exception as exc:                                 # noqa: BLE001
-        print(f"Ollama unavailable ({exc}) -> deterministic scores", flush=True)
-        return None
-    if not isinstance(raw, list):
-        return None
-
     adjustments = {}
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        index = entry.get("index")
-        adjustment = entry.get("adjustment")
-        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(ranked):
-            continue
-        if isinstance(adjustment, bool) or not isinstance(adjustment, (int, float)):
-            continue
-        if not math.isfinite(adjustment):
-            continue
-        adjustments[index] = (max(-1.0, min(1.0, float(adjustment))),
-                              str(entry.get("reason", ""))[:120])
+    for offset in range(0, len(ranked), 10):
+        batch = ranked[offset:offset + 10]
+        sent = [{"index": i, "start": item["start"], "end": item["end"],
+                 "text": str(item.get("text", ""))}
+                for i, item in enumerate(batch)]
+        messages = [
+            {"role": "system", "content": RERANK_SYSTEM},
+            {"role": "user", "content": json.dumps(sent, ensure_ascii=False)},
+        ]
+        try:
+            raw = send_batch(messages)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"{provider} reranking failed ({exc}); using deterministic scores.",
+                  flush=True)
+            return None
+        results = _valid_rerank_results(raw, len(batch))
+        if results is None:
+            print(f"{provider} reranking returned invalid JSON; "
+                  "using deterministic scores.", flush=True)
+            return None
+        for index, adjustment, reason in results:
+            adjustments[offset + index] = (adjustment, reason)
     if not adjustments:
         return None
 
@@ -1346,6 +1462,22 @@ def ollama_rerank(candidates, model, host=OLLAMA_HOST, timeout=120):
             base_reason = str(record.get("reason", ""))[:160]
             record["reason"] = (base_reason + " | " + reason)[:160]
     return updated
+
+
+def ollama_rerank(candidates, model, host=OLLAMA_HOST, timeout=120):
+    """Rerank candidates through local Ollama without changing timestamps."""
+    return _rerank_batches(
+        candidates,
+        lambda messages: _ollama_chat(model, host, messages, timeout),
+        model, "Ollama")
+
+
+def hosted_rerank(candidates, url, model, api_key=None, timeout=120):
+    """Rerank only when the caller explicitly configures a hosted endpoint."""
+    return _rerank_batches(
+        candidates,
+        lambda messages: _hosted_chat(url, model, api_key, messages, timeout),
+        model, "Hosted LLM")
 
 
 def _nearest(values, t):
@@ -1498,11 +1630,12 @@ def attach_media_evidence(candidates, sections, timeline, profile, energy,
     return updated
 
 
-def discover(workdir, min_len=15, max_len=300, preferred_len=None,
+def discover(workdir, min_len=15, max_len=90, preferred_len=None,
              band=None, progress=None):
     """Load the transcript, measure evidence, discover, write candidates.json."""
     workdir = Path(workdir)
     data = load_transcript(workdir)
+    language = data.get("language") or "en"
     sentences = sentenceize(data.get("words") or [])
     (timeline, profile, energy, _, audio_usable,
      baseline) = source_evidence(workdir, data)
@@ -1533,11 +1666,11 @@ def discover(workdir, min_len=15, max_len=300, preferred_len=None,
             candidates, stats = discover_blocks(
                 sentences, min_len, max_len, preferred_len=preferred_len,
                 band=effective_band, duration=duration, workdir=workdir,
-                progress=progress)
+                progress=progress, language=language)
         else:
             candidates, stats = discover_candidates(
                 sentences, min_len, max_len, preferred_len=preferred_len,
-                band=effective_band, progress=progress)
+                band=effective_band, progress=progress, language=language)
         candidates = attach_audio_evidence(
             candidates, usable_timeline, profile, energy)
 
@@ -1554,6 +1687,7 @@ def discover(workdir, min_len=15, max_len=300, preferred_len=None,
             "Visual evidence was unavailable; scored from audio and text.")
     stats.update({
         "source_duration": source_duration or stats.get("source_duration"),
+        "language": language,
         "content_profile": profile,
         "source_energy": energy,
         "evidence_available": {
@@ -1585,6 +1719,7 @@ def select(workdir, min_score=8.0, max_clips=None, preferred_len=None,
         if band is None else band)
     deduped = dedupe_candidates(candidates, preferred_len=preferred_len,
                                 band=effective_band, min_score=min_score)
+    llm_status = "not_requested"
     if llm:
         adjusted = ollama_rerank(deduped[:50], llm, host)
         if adjusted is not None:
@@ -1595,12 +1730,39 @@ def select(workdir, min_score=8.0, max_clips=None, preferred_len=None,
             deduped = [by_key.get(_candidate_key(item), item) for item in deduped]
             mode = "ollama"
             save_candidates(workdir, candidates, discovery, mode=mode)
+            llm_status = "ok"
+        else:
+            llm_status = "failed"
+    elif os.environ.get("CHOPIFY_HOSTED_LLM_URL"):
+        url = os.environ["CHOPIFY_HOSTED_LLM_URL"].strip()
+        model = os.environ.get("CHOPIFY_HOSTED_LLM_MODEL", "").strip()
+        if not url or not model:
+            print("Hosted LLM is enabled but CHOPIFY_HOSTED_LLM_MODEL is empty; "
+                  "using deterministic scores.", flush=True)
+            llm_status = "failed"
+        else:
+            adjusted = hosted_rerank(
+                deduped[:50], url, model,
+                os.environ.get("CHOPIFY_HOSTED_LLM_API_KEY"))
+            if adjusted is not None:
+                by_key = {_candidate_key(item): item for item in adjusted}
+                candidates = [{**item, **by_key[_candidate_key(item)]}
+                              if _candidate_key(item) in by_key else item
+                              for item in candidates]
+                deduped = [by_key.get(_candidate_key(item), item)
+                           for item in deduped]
+                mode = "hosted"
+                save_candidates(workdir, candidates, discovery, mode=mode)
+                llm_status = "ok"
+            else:
+                llm_status = "failed"
 
     segments, stats = select_candidates(
         deduped, min_score=min_score, max_clips=max_clips,
         preferred_len=preferred_len, band=effective_band, dedupe=False,
         discovery=discovery, mode=mode,
         evidence_available=discovery.get("evidence_available"))
+    stats["llm_status"] = llm_status
     _write_json(workdir / "segments.json", segments)
     _write_json(workdir / "selection.json", stats)
     return segments, mode
@@ -1614,6 +1776,7 @@ def _select_supplied(workdir, records, stats, min_score, max_clips,
     segments, selection = select_candidates(
         deduped, min_score=min_score, max_clips=max_clips,
         preferred_len=preferred_len, dedupe=False, discovery=stats, mode=mode)
+    selection["llm_status"] = "not_requested"
     _write_json(Path(workdir) / "segments.json", segments)
     _write_json(Path(workdir) / "selection.json", selection)
     return segments
@@ -1639,7 +1802,7 @@ def _no_clips_message(workdir, threshold):
 
 
 def run(workdir, llm=None, host=OLLAMA_HOST, min_score=None, max_clips=None,
-        min_len=15, max_len=300, search=None, pick=None, semantic=None,
+        min_len=15, max_len=90, search=None, pick=None, semantic=None,
         embed_model="nomic-embed-text", preferred_len=None, explain=False):
     """Score the transcript in workdir and write the discovery artifacts.
 
@@ -1662,7 +1825,8 @@ def run(workdir, llm=None, host=OLLAMA_HOST, min_score=None, max_clips=None,
               f"{data['duration']:.0f}s", flush=True)
         from semantic import candidates as semantic_candidates
         records = semantic_candidates(sentences, semantic, embed_model, workdir,
-                                      min_len, max_len, max_clips)
+                                      min_len, max_len, max_clips,
+                                      language=data.get("language") or "en")
         mode = "semantic"
         effective_score = 0.0
         if not records:
@@ -1684,7 +1848,7 @@ def run(workdir, llm=None, host=OLLAMA_HOST, min_score=None, max_clips=None,
                 "Try fewer or different keywords.")
         found, stats = discover_candidates(
             sentences, min_len, max_len, preferred_len=preferred_len,
-            seed_indices=hits)
+            seed_indices=hits, language=data.get("language") or "en")
         records = dedupe_candidates(found, preferred_len=preferred_len)
         mode = "heuristic"
         effective_score = 0.0
@@ -1728,7 +1892,7 @@ def main():
     ap.add_argument("--max-clips", type=int, default=None,
                     help="optional safety cap; default all passing clips")
     ap.add_argument("--min-len", type=int, default=15, help="min clip seconds")
-    ap.add_argument("--max-len", type=int, default=300, help="max clip seconds")
+    ap.add_argument("--max-len", type=int, default=90, help="max clip seconds")
     ap.add_argument("--preferred-len", default=None, metavar="D",
                     help="soft preferred length, e.g. 45s, 2m, 1m30s")
     ap.add_argument("--explain", action="store_true",

@@ -94,7 +94,7 @@ def test_profile_thresholds():
 
 
 def test_profile_bands_and_weight_floor():
-    assert evidence.profile_band("talk") == (45, 180)
+    assert evidence.profile_band("talk") == (30, 90)
     assert evidence.profile_band("mixed") == (30, 120)
     assert evidence.profile_band("gameplay/action") == (15, 60)
     assert evidence.evidence_weight(0.0, "talk") == pytest.approx(0.20)
@@ -116,4 +116,3 @@ def test_combine_evidence_shrinks_single_modality():
     assert evidence.combine_evidence(8.0, 8.0) == pytest.approx(8.0)
     assert evidence.combine_evidence(8.0, None) == pytest.approx(7.55)
     assert evidence.combine_evidence(None, None) == pytest.approx(5.0)
-

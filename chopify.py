@@ -181,8 +181,10 @@ def main():
                     help="print the caption style preset names and exit")
     ap.add_argument("url", nargs="?", help="local video path or yt-dlp-supported URL")
     ap.add_argument("--workdir", default="work", help="intermediate files dir")
-    ap.add_argument("--aspect", default="16:9", choices=["16:9", "9:16", "1:1"],
-                    help="output aspect ratio (default 16:9)")
+    ap.add_argument("--aspect", default="9:16", choices=["16:9", "9:16", "1:1"],
+                    help="output aspect ratio (default 9:16)")
+    ap.add_argument("--platform", choices=["reels", "shorts", "tiktok"],
+                    help="apply the platform's preferred and maximum clip lengths")
     ap.add_argument("--out", default=None,
                     help="output directory (default ./clips, or $CHOPIFY_OUT)")
     ap.add_argument("--style", default="default",
@@ -210,7 +212,7 @@ def main():
     ap.add_argument("--max-clips", type=int, default=None,
                     help="optional safety cap; default all passing clips")
     ap.add_argument("--min-len", type=int, default=15, help="min clip seconds")
-    ap.add_argument("--max-len", type=int, default=300, help="max clip seconds")
+    ap.add_argument("--max-len", type=int, default=90, help="max clip seconds")
     ap.add_argument("--no-input", action="store_true",
                     help="never prompt; use flags and defaults")
     ap.add_argument("--explain", action="store_true",
@@ -229,7 +231,8 @@ def main():
     ap.add_argument("--semantic", help="find clips by meaning with local embeddings")
     ap.add_argument("--embed-model", default="nomic-embed-text")
     ap.add_argument("--brand", help="JSON brand preset path")
-    ap.add_argument("--layout", choices=["single", "split"], default="single")
+    ap.add_argument("--layout", choices=["auto", "single", "split", "blur-fit"],
+                    default="auto")
     ap.add_argument("--centers", type=float, nargs=2, default=[0.25, 0.75],
                     help="horizontal speaker centers from 0 to 1 for split-screen")
     ap.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
@@ -260,7 +263,14 @@ def main():
               "faster-whisper, opencv)", flush=True)
 
     import projects
-    options = {k: getattr(args, k, None) for k in projects.DEFAULT_OPTIONS if k != "caption"}
+    options = {k: getattr(args, k, projects.DEFAULT_OPTIONS[k])
+               for k in projects.DEFAULT_OPTIONS if k != "caption"}
+    if args.platform:
+        preset = score_clips.PLATFORM_PRESETS[args.platform]
+        if not flag_given("--max-len"):
+            options["max_len"] = preset["max_len"]
+        if not flag_given("--preferred-len"):
+            options["preferred_len"] = preset["preferred_len"]
     options["caption"] = caption
     if options["min_score"] is None:
         options["min_score"] = 8.0
@@ -296,6 +306,11 @@ def main():
                     continue
                 if flag_given("--" + key.replace("_", "-")):
                     state["options"][key] = options[key]
+            if flag_given("--platform"):
+                preset = score_clips.PLATFORM_PRESETS[args.platform]
+                for key in ("max_len", "preferred_len"):
+                    if not flag_given("--" + key.replace("_", "-")):
+                        state["options"][key] = preset[key]
             if interactive:
                 if ask_score:
                     state["options"]["min_score"] = prompted["min_score"]
@@ -355,7 +370,7 @@ def main():
                     if file.exists() and file.resolve() != target.resolve():
                         shutil.copy2(file, target)
             print(f"Exports: {export}")
-            if result.get("status") == "failed":
+            if result.get("status") in {"failed", "complete_with_errors"}:
                 failed = len(result.get("render_errors") or [])
                 ap.exit(1, f"Chopify: {failed} clip(s) failed to render; "
                            "successful exports were kept.\n")

@@ -148,6 +148,34 @@ class TestDurationLadder:
         assert score_clips.duration_ladder(40, 100) == [40, 45, 60, 90, 100]
 
 
+class TestPlatformDefaults:
+    def test_vertical_and_ninety_second_defaults(self):
+        import projects
+        assert projects.DEFAULT_OPTIONS["aspect"] == "9:16"
+        assert projects.DEFAULT_OPTIONS["max_len"] == 90
+        assert render_clips.DEFAULT_ASPECT == "9:16"
+
+    def test_platform_presets_share_maximum_and_preferred_lengths(self):
+        assert score_clips.PLATFORM_PRESETS == {
+            "reels": {"max_len": 90, "preferred_len": 45},
+            "shorts": {"max_len": 60, "preferred_len": 45},
+            "tiktok": {"max_len": 180, "preferred_len": 60},
+        }
+
+    def test_cli_platform_sets_project_duration_options(self, monkeypatch, tmp_path):
+        import projects
+        monkeypatch.setattr(sys, "argv", [
+            "chopify", "recording.mp4", "--platform", "shorts",
+            "--no-preflight", "--no-input", "--action", "prepare",
+            "--workdir", str(tmp_path / "shorts")])
+        monkeypatch.setattr(projects, "run_project",
+                            lambda path, **kwargs: projects.read_project(path))
+        chopify.main()
+        saved = projects.read_project(tmp_path / "shorts")
+        assert saved["options"]["max_len"] == 60
+        assert saved["options"]["preferred_len"] == 45
+
+
 class TestScoring:
     def test_hook_sentence_scores_higher(self, sample_words):
         sents = score_clips.sentenceize(sample_words)
@@ -373,8 +401,10 @@ class TestSelection:
     def test_zero_passing_writes_empty_stats(self):
         segments, stats = score_clips.select_candidates(
             [candidate(0, 40, 7.2)], min_score=8.0)
-        assert segments == []
+        assert len(segments) == 1
+        assert segments[0]["low_confidence"] is True
         assert stats["passing"] == 0
+        assert stats["low_confidence"] is True
         assert stats["passing_score_min"] is None
         assert stats["score_min"] == 7.2
 
@@ -414,12 +444,17 @@ class TestArtifacts:
                             "windows_scanned": 1, "source_duration": 20.0,
                             "content_profile": "mixed", "source_energy": 0.5}))
         segs, _ = score_clips.run(workdir, min_score=8.0, min_len=4, max_len=20)
-        assert segs == []
-        assert json.loads((workdir / "segments.json").read_text()) == []
+        assert len(segs) == 1
+        assert segs[0]["low_confidence"] is True
+        selection = json.loads((workdir / "selection.json").read_text())
+        assert selection["low_confidence"] is True
+        assert json.loads((workdir / "segments.json").read_text())[0][
+            "low_confidence"] is True
 
     def test_llm_adjustment_changes_score_not_times(self, workdir, monkeypatch):
         def fake_chat(model, host, messages, timeout):
-            return [{"index": 0, "adjustment": 0.4, "reason": "strong reaction"}]
+            return {"results": [
+                {"index": 0, "adjustment": 0.4, "reason": "strong reaction"}]}
         monkeypatch.setattr(score_clips, "_ollama_chat", fake_chat)
         segs, mode = score_clips.run(workdir, min_score=0, min_len=4, max_len=20,
                                      llm="test-model")
@@ -429,11 +464,14 @@ class TestArtifacts:
 
     def test_invalid_llm_response_is_ignored(self, workdir, monkeypatch):
         monkeypatch.setattr(score_clips, "_ollama_chat",
-                            lambda *a, **k: [{"index": 99, "adjustment": 9}])
+                            lambda *a, **k: {"results": [
+                                {"index": 99, "adjustment": 9, "reason": "bad"}]})
         segs, mode = score_clips.run(workdir, min_score=0, min_len=4, max_len=20,
                                      llm="test-model")
         assert mode == "heuristic"
         assert segs
+        assert json.loads((workdir / "selection.json").read_text())[
+            "llm_status"] == "failed"
 
 
 class TestSearchSharesBuilder:
@@ -539,6 +577,74 @@ class TestRemap:
 # ------------------------------------------------------------- render_clips
 
 class TestRenderHelpers:
+    def test_tracked_render_failure_retries_center_crop(self, tmp_path, monkeypatch):
+        source = tmp_path / "source.mp4"
+        source.write_bytes(b"fixture")
+        out_dir = tmp_path / "output"
+        monkeypatch.setattr(render_clips, "ffprobe_duration", lambda _: 10.0)
+        monkeypatch.setattr(
+            render_clips, "detect_track",
+            lambda *args: {"frames": [(0.0, [320.0])], "face_share": 1.0})
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 1:
+                raise subprocess.CalledProcessError(1, command, stderr="bad crop")
+            return subprocess.CompletedProcess(command, 0)
+
+        monkeypatch.setattr(render_clips.subprocess, "run", fake_run)
+        render_clips.render(
+            {"start": 1, "end": 3, "hook": "crop retry"}, [],
+            source, 640, 360, tmp_path, "9:16", out_dir=out_dir, preview=True)
+        assert len(calls) == 2
+        assert "sendcmd=" in calls[0][calls[0].index("-vf") + 1]
+        assert "sendcmd=" not in calls[1][calls[1].index("-vf") + 1]
+
+    def test_failed_render_reports_stderr_tail_and_cleans_scratch(
+            self, tmp_path, monkeypatch):
+        source = tmp_path / "source.mp4"
+        source.write_bytes(b"fixture")
+        out_dir = tmp_path / "output"
+        out_dir.mkdir()
+        for name in ("_crop.cmd", "_tight_source.mp4", "_det.mp4"):
+            (out_dir / name).write_text("scratch")
+        monkeypatch.setattr(render_clips, "ffprobe_duration", lambda _: 5.0)
+
+        def fail(command, **kwargs):
+            raise subprocess.CalledProcessError(
+                1, command, stderr="\n".join(f"line {i}" for i in range(20)))
+
+        monkeypatch.setattr(render_clips.subprocess, "run", fail)
+        with pytest.raises(RuntimeError, match="line 19") as exc:
+            render_clips.render(
+                {"start": 1, "end": 3, "hook": "failed"}, [],
+                source, 640, 360, tmp_path, "16:9",
+                out_dir=out_dir, preview=True)
+        assert "line 19" in str(exc.value)
+        assert "line 1\n" not in str(exc.value)
+        assert all(not (out_dir / name).exists() for name in (
+            "_caption.ass", "_crop.cmd", "_tight_source.mp4", "_det.mp4"))
+
+    def test_padding_respects_neighbor_gap_and_media_edges(self):
+        words = [
+            {"start": 0.7, "end": 0.9},
+            {"start": 1.0, "end": 1.4},
+            {"start": 1.5, "end": 2.0},
+            {"start": 2.3, "end": 2.6},
+        ]
+        assert render_clips.padded_clip_bounds(1.0, 2.0, words, 10.0) == \
+            pytest.approx((0.95, 2.15))
+        assert render_clips.padded_clip_bounds(
+            0.1, 0.5, [], 0.6) == pytest.approx((0.0, 0.6))
+
+    def test_audio_filters_combine_fades_and_optional_loudnorm(self):
+        filters = render_clips.audio_filter_chain(2.0, loudnorm=True)
+        assert filters == (
+            "afade=t=in:st=0:d=0.150,"
+            "afade=t=out:st=1.750:d=0.250,"
+            "loudnorm=I=-14:TP=-1.5:LRA=11")
+
     def test_sanitize_filename(self):
         assert render_clips.sanitize("Hello, World! 123") == "hello-world-123"
         assert render_clips.sanitize("") == "clip"
@@ -576,6 +682,72 @@ class TestWriteMeta:
         assert meta["score"] == 8.2
         assert "The biggest mistake" in meta["title"]
         assert meta["hashtags"][0] == "#shorts"
+
+    def test_metadata_fallback_uses_original_sentence_and_profile_tags(self, tmp_path,
+                                                                        monkeypatch):
+        monkeypatch.delenv("CHOPIFY_HOSTED_LLM_URL", raising=False)
+        words = [
+            {"word": "Why", "start": 0.0, "end": 0.2},
+            {"word": "Creators", "start": 0.2, "end": 0.5},
+            {"word": "win.", "start": 0.5, "end": 0.8},
+            {"word": "Second", "start": 0.9, "end": 1.1},
+            {"word": "sentence.", "start": 1.1, "end": 1.5},
+        ]
+        clip = tmp_path / "clip.mp4"
+        path = render_clips.write_meta(
+            {"start": 0, "end": 2, "hook": "filename-hook"},
+            clip, {"title": "Original episode"}, "talk", words)
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        assert meta["title"] == "Why Creators win."
+        assert len(meta["title"]) <= 60
+        assert "#podcast" in meta["hashtags"]
+        assert 3 <= len(meta["hashtags"]) <= 5
+        assert "Original episode" in meta["description"]
+        assert "full video on the channel" not in meta["description"]
+
+        non_talk_path = render_clips.write_meta(
+            {"start": 0, "end": 2, "hook": "filename-hook"},
+            tmp_path / "non-talk.mp4", {}, "gameplay/action", words)
+        non_talk = json.loads(non_talk_path.read_text(encoding="utf-8"))
+        assert "#podcast" not in non_talk["hashtags"]
+
+    def test_metadata_generation_uses_only_configured_hosted_endpoint(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CHOPIFY_HOSTED_LLM_URL", "https://llm.example/v1")
+        monkeypatch.setenv("CHOPIFY_HOSTED_LLM_MODEL", "small-model")
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": json.dumps({
+                    "title": "An accurate clip title",
+                    "description": "A concise description.",
+                    "hashtags": ["#shorts", "#reels", "#creators"],
+                })}}]}).encode()
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["payload"] = json.loads(request.data)
+            return FakeResponse()
+
+        monkeypatch.setattr(render_clips.urllib.request, "urlopen", fake_urlopen)
+        path = render_clips.write_meta(
+            {"start": 0, "end": 4, "hook": "fallback"},
+            tmp_path / "hosted.mp4", {"title": "Episode"}, "mixed",
+            [{"word": "full", "start": 0, "end": 1},
+             {"word": "transcript", "start": 1, "end": 2}])
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        assert captured["url"] == "https://llm.example/v1/chat/completions"
+        sent = captured["payload"]["messages"][1]["content"]
+        assert "full transcript" in sent
+        assert meta["title"] == "An accurate clip title"
+        assert meta["llm_status"] == "ok"
 
 
 class TestASS:
@@ -886,7 +1058,8 @@ class TestCreatorEvidence:
     def test_ollama_rerank_uses_final_score(self, monkeypatch):
         monkeypatch.setattr(
             score_clips, "_ollama_chat",
-            lambda *a, **k: [{"index": 0, "adjustment": 0.3}])
+            lambda *a, **k: {"results": [
+                {"index": 0, "adjustment": 0.3, "reason": ""}]})
         records = [{"start": 0.0, "end": 10.0, "duration": 10.0,
                     "overall": 7.0, "raw_score": 8.0, "text": "x"}]
         updated = score_clips.ollama_rerank(records, "test")
@@ -896,12 +1069,47 @@ class TestCreatorEvidence:
     def test_ollama_rerank_does_not_compound(self, monkeypatch):
         monkeypatch.setattr(
             score_clips, "_ollama_chat",
-            lambda *a, **k: [{"index": 0, "adjustment": 0.3}])
+            lambda *a, **k: {"results": [
+                {"index": 0, "adjustment": 0.3, "reason": ""}]})
         records = [{"start": 0.0, "end": 10.0, "duration": 10.0,
                     "overall": 7.3, "raw_score": 8.0, "text": "x",
                     "llm_adjustment": 0.3}]
         updated = score_clips.ollama_rerank(records, "test")
         assert updated[0]["overall"] == pytest.approx(7.3, abs=0.05)
+
+    def test_non_english_scoring_disables_english_cues(self):
+        words = (sentence("Nobody tells you the secret and truth.", 0.0)
+                 + sentence("It changes everything forever.", 8.0))
+        sentences = score_clips.sentenceize(words)
+        english_parts, _, _ = score_clips.score_window(
+            sentences, 0, 1, language="en")
+        other_parts, _, _ = score_clips.score_window(
+            sentences, 0, 1, language="es")
+        assert english_parts["hook"] > 0
+        assert other_parts["hook"] == 0
+        assert other_parts["quotability"] == 0
+        assert other_parts["energy"] > 0
+        assert other_parts["arc"] > 0
+
+    def test_ollama_rerank_batches_full_text(self, monkeypatch):
+        calls = []
+
+        def fake_chat(model, host, messages, timeout):
+            batch = json.loads(messages[1]["content"])
+            calls.append(batch)
+            return {"results": [
+                {"index": item["index"], "adjustment": 0.1, "reason": "ok"}
+                for item in batch]}
+
+        monkeypatch.setattr(score_clips, "_ollama_chat", fake_chat)
+        candidates = [candidate(i * 10, i * 10 + 5, 7.0) |
+                      {"text": "x" * 1000} for i in range(21)]
+        updated = score_clips.ollama_rerank(candidates, "model")
+        assert len(calls) == 3
+        assert [len(batch) for batch in calls] == [10, 10, 1]
+        assert all(item["text"] == "x" * 1000 for batch in calls
+                   for item in batch)
+        assert len(updated) == 21
 
     def test_sparse_windows_use_text_floor(self, tmp_path, monkeypatch):
         import evidence
@@ -1067,7 +1275,7 @@ def test_silent_flat_source_fails_without_visual_evidence(tmp_path, monkeypatch)
         score_clips.run(wd, min_score=8.0)
 
 
-def test_flat_visual_action_cannot_pass_eight(tmp_path, monkeypatch):
+def test_flat_visual_action_returns_low_confidence_option(tmp_path, monkeypatch):
     import visual
     source = tmp_path / "flat.mp4"
     source.write_bytes(b"x")
@@ -1080,7 +1288,10 @@ def test_flat_visual_action_cannot_pass_eight(tmp_path, monkeypatch):
         lambda *a, **k: [flat_action_features(0.0, 20.0)])
     segs, _ = score_clips.run(
         wd, min_score=8.0, min_len=5, max_len=20, preferred_len=15)
-    assert segs == []
+    assert len(segs) == 1
+    assert segs[0]["low_confidence"] is True
+    selection = json.loads((wd / "selection.json").read_text())
+    assert selection["low_confidence"] is True
 
 
 # ------------------------------------------------------ section source offsets
@@ -1090,6 +1301,8 @@ def test_render_seeks_inside_section_with_global_caption_times(tmp_path, monkeyp
 
     def fake_run(cmd, **kwargs):
         commands.append([str(c) for c in cmd])
+        if cmd[0] == "ffprobe":
+            return subprocess.CompletedProcess(cmd, 0, stdout="10\n")
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(render_clips.subprocess, "run", fake_run)
@@ -1100,8 +1313,8 @@ def test_render_seeks_inside_section_with_global_caption_times(tmp_path, monkeyp
         [{"word": "hello", "start": 55, "end": 56}],
         source, 640, 360, tmp_path, "16:9", out_dir=tmp_path, preview=True,
         source_offset=50)
-    assert commands[0][commands[0].index("-ss") + 1] == "5.000"
-    assert "00:00:00,000" in out.with_suffix(".srt").read_text()
+    assert commands[1][commands[1].index("-ss") + 1] == "4.750"
+    assert "00:00:00,250" in out.with_suffix(".srt").read_text()
 
 
 def test_render_rejects_clip_before_source_offset(tmp_path):

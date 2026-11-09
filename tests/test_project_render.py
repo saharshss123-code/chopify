@@ -37,9 +37,9 @@ def test_failed_job_retains_successful_clips_for_retry(tmp_path, monkeypatch):
             raise subprocess.CalledProcessError(1, "ffmpeg")
         return fake_render(segment, *args, **kwargs)
     monkeypatch.setattr(projects.render_clips, "render", fail_second)
-    with pytest.raises(subprocess.CalledProcessError):
-        projects.run_project(path, action="render")
-    assert projects.read_project(path)["status"] == "failed"
+    partial = projects.run_project(path, action="render")
+    assert partial["status"] == "complete_with_errors"
+    assert len(partial["render_errors"]) == 1
     assert len(projects.read_project(path)["renders"]) == 1
     def succeed(segment, *args, **kwargs):
         calls.append(segment["start"])
@@ -207,7 +207,7 @@ def test_partial_section_failure_keeps_outputs_for_retry(tmp_path, monkeypatch):
                         lambda p: (640, 360))
     monkeypatch.setattr(projects.render_clips, "render", fake_section_render)
     state = projects.run_project(path, action="render")
-    assert state["status"] == "failed"
+    assert state["status"] == "complete_with_errors"
     assert len(state["last_outputs"]) == 1
     assert len(state["render_errors"]) == 1
     assert section.exists()

@@ -110,7 +110,8 @@ def apply_cuts(source, keeps, clip_start, out_path, crf=18, source_offset=0.0):
                 ["ffmpeg", "-y", "-ss", f"{seek:.3f}", "-i", str(source),
                  "-t", f"{b - a:.3f}", "-c:v", "libx264", "-preset", "veryfast",
                  "-crf", str(crf), "-c:a", "aac", "-b:a", "160k", str(part)],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                text=True)
             parts.append(part)
         lst = tmp / "list.txt"
         lst.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts),
@@ -118,7 +119,8 @@ def apply_cuts(source, keeps, clip_start, out_path, crf=18, source_offset=0.0):
         subprocess.run(
             ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
              "-c", "copy", str(out_path)],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True)
     finally:
         for p in parts:
             try:

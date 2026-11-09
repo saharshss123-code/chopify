@@ -23,6 +23,7 @@ import json
 import argparse
 import subprocess
 import math
+import urllib.request
 from pathlib import Path
 
 import branding
@@ -34,7 +35,7 @@ ASPECTS = {
     "9:16": (1080, 1920, 96, 300),
     "1:1":  (1080, 1080, 82, 120),
 }
-DEFAULT_ASPECT = "16:9"
+DEFAULT_ASPECT = "9:16"
 
 # --preview drafts: small, fast, no poster/meta. Caption font/margins scale down
 # proportionally from the full-size ASPECTS values (height is the anchor).
@@ -289,6 +290,41 @@ def ffprobe_dims(path):
     return int(w), int(h)
 
 
+def ffprobe_duration(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True, check=True).stdout.strip()
+    duration = float(out)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError(f"Invalid media duration for {path}")
+    return duration
+
+
+def padded_clip_bounds(start, end, words, duration, minimum=0.0,
+                       before=0.25, after=0.35):
+    """Pad clip bounds without crossing nearby words or the source limits."""
+    earlier = [float(word["end"]) for word in words
+               if float(word["end"]) <= start]
+    later = [float(word["start"]) for word in words
+             if float(word["start"]) >= end]
+    left_pad = min(before, (start - max(earlier)) / 2) if earlier else before
+    right_pad = min(after, (min(later) - end) / 2) if later else after
+    return max(minimum, start - left_pad), min(duration, end + right_pad)
+
+
+def audio_filter_chain(duration, loudnorm=False):
+    fade_in = min(0.15, duration)
+    fade_out = min(0.25, duration)
+    filters = [
+        f"afade=t=in:st=0:d={fade_in:.3f}",
+        f"afade=t=out:st={max(0.0, duration - fade_out):.3f}:d={fade_out:.3f}",
+    ]
+    if loudnorm:
+        filters.append("loudnorm=I=-14:TP=-1.5:LRA=11")
+    return ",".join(filters)
+
+
 def crop_for(W, H, tw, th):
     """Largest centred crop of the WxH source matching the target aspect."""
     tar = tw / float(th)
@@ -327,54 +363,62 @@ def _make_detector(workdir):
 
 
 def detect_track(source, start, dur, W, workdir):
-    """Low-res detection pass -> [(t_rel, center_x_source_px or None)]."""
+    """Return all face centers per sampled frame and the fraction with faces."""
     import cv2
     det_path = Path(workdir) / "_det.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", str(source),
-         "-t", f"{dur:.3f}", "-vf", f"fps={DET_FPS},scale={DET_W}:-2",
-         "-an", str(det_path)],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    kind, det = _make_detector(workdir)
-    cap = cv2.VideoCapture(str(det_path))
-    dw = cap.get(cv2.CAP_PROP_FRAME_WIDTH) or DET_W
-    dh = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 360
-    sx = W / float(dw)
-    if kind == "yunet":
-        det.setInputSize((int(dw), int(dh)))
-    track = []
-    i = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        t = i / float(DET_FPS)
-        cx = None
-        if kind == "yunet":
-            _, faces = det.detect(frame)
-            if faces is not None and len(faces):
-                best = max(faces, key=lambda f: f[2] * f[3] * float(f[14]))
-                cx = (best[0] + best[2] / 2.0) * sx
-        else:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = det.detectMultiScale(gray, 1.1, 5, minSize=(36, 36))
-            if len(faces):
-                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-                cx = (x + w / 2.0) * sx
-        track.append((t, cx))
-        i += 1
-    cap.release()
     try:
-        det_path.unlink()
-    except OSError:
-        pass
-    return track
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", str(source),
+             "-t", f"{dur:.3f}", "-vf", f"fps={DET_FPS},scale={DET_W}:-2",
+             "-an", str(det_path)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True)
+        kind, det = _make_detector(workdir)
+        cap = cv2.VideoCapture(str(det_path))
+        try:
+            dw = cap.get(cv2.CAP_PROP_FRAME_WIDTH) or DET_W
+            dh = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 360
+            sx = W / float(dw)
+            if kind == "yunet":
+                det.setInputSize((int(dw), int(dh)))
+            frames = []
+            frames_with_faces = 0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                t = len(frames) / float(DET_FPS)
+                if kind == "yunet":
+                    _, faces = det.detect(frame)
+                    centers = ([(float(face[0] + face[2] / 2.0) * sx)
+                                for face in faces]
+                               if faces is not None else [])
+                else:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    faces = det.detectMultiScale(
+                        gray, 1.1, 5, minSize=(36, 36))
+                    centers = [float(x + width / 2.0) * sx
+                               for x, _, width, _ in faces]
+                centers.sort()
+                frames.append((t, centers))
+                frames_with_faces += bool(centers)
+            share = frames_with_faces / len(frames) if frames else 0.0
+            return {"frames": frames, "face_share": share}
+        finally:
+            cap.release()
+    finally:
+        try:
+            det_path.unlink()
+        except OSError:
+            pass
 
 
 def smooth_track(track, W, crop_w):
     half = crop_w / 2.0
     max_off = half - crop_w * MARGIN_FRAC
     jump = W * JUMP_FRAC
+    track = [(time, (sum(centers) / len(centers) if centers else None))
+             for time, centers in track]
     known = [c for _, c in track if c is not None]
     base = sorted(known)[len(known) // 2] if known else W / 2.0
     filled = []
@@ -401,6 +445,22 @@ def smooth_track(track, W, crop_w):
         prev_face = face
         out.append((t, min(max(c, half), W - half)))
     return out
+
+
+def automatic_layout(detections, W, crop_w):
+    """Choose blur-fit, split speakers, or tracked single-face framing."""
+    frames = detections["frames"]
+    if detections["face_share"] < 0.30:
+        return "blur-fit", (0.25, 0.75)
+    wide_pairs = [centers for _, centers in frames
+                  if len(centers) >= 2 and centers[-1] - centers[0] > crop_w]
+    sustained = max(3, math.ceil(len(frames) * 0.30))
+    if len(wide_pairs) >= sustained:
+        left = sorted(centers[0] for centers in wide_pairs)
+        right = sorted(centers[-1] for centers in wide_pairs)
+        return "split", (left[len(left) // 2] / W,
+                         right[len(right) // 2] / W)
+    return "single", (0.25, 0.75)
 
 
 def build_sendcmd(track, crop_w, path):
@@ -538,19 +598,122 @@ def build_ass(words, clip_start, clip_end, path, tw, th, font_size, margin_v,
     Path(path).write_text(header + "\n".join(events) + "\n", encoding="utf-8")
 
 
-def write_meta(seg, out_path):
-    """Deterministic ready-to-post metadata saved as <clip>.meta.json."""
-    hook = str(seg.get("hook", "clip")).replace("-", " ").strip()
-    title = hook.capitalize()
-    meta = {
-        "title": f"{title} #shorts",
-        "description": (f"{hook.capitalize()} - full video on the channel.\n"
-                        "#shorts #reels #fyp #viral #podcast"),
-        "hashtags": ["#shorts", "#reels", "#fyp", "#viral"],
+def _fallback_metadata(seg, source_meta, content_profile, words):
+    text = " ".join(str(word.get("word", "")).strip() for word in words).strip()
+    text = text or str(seg.get("text") or seg.get("hook", "clip")).replace("-", " ")
+    sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
+    if not words and not seg.get("text") and sentence:
+        sentence = sentence[:1].upper() + sentence[1:]
+    title = (sentence or "Clip")[:60].rstrip()
+    tokens = re.findall(r"[A-Za-z0-9]{3,}", sentence.lower())
+    stopwords = {"about", "after", "again", "because", "before", "could",
+                 "every", "from", "have", "just", "more", "people", "that",
+                 "their", "there", "these", "this", "those", "through",
+                 "under", "what", "when", "where", "which", "with", "would",
+                 "your"}
+    keywords = []
+    for token in tokens:
+        if token not in stopwords and token not in keywords:
+            keywords.append(token)
+    hashtags = ["#shorts", "#reels"]
+    hashtags.extend("#" + token for token in keywords[:2])
+    if content_profile == "talk":
+        hashtags.append("#podcast")
+    elif len(hashtags) < 3:
+        hashtags.append("#creator")
+    hashtags = hashtags[:5]
+    source_title = str((source_meta or {}).get("title") or "").strip()
+    description = sentence or title
+    if source_title:
+        description += f"\nFrom: {source_title}"
+    return {"title": title, "description": description, "hashtags": hashtags}
+
+
+def _hosted_metadata(text, source_meta, content_profile):
+    url = os.environ.get("CHOPIFY_HOSTED_LLM_URL")
+    model = os.environ.get("CHOPIFY_HOSTED_LLM_MODEL")
+    if not url:
+        return None, "not_requested"
+    if not model:
+        return None, "failed"
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string"},
+            "description": {"type": "string"},
+            "hashtags": {"type": "array", "items": {"type": "string"},
+                         "minItems": 3, "maxItems": 5},
+        },
+        "required": ["title", "description", "hashtags"],
+    }
+    messages = [
+        {"role": "system", "content": (
+            "Write accurate short-video metadata from the supplied source and "
+            "clip transcript. Do not invent claims. Return only schema JSON. "
+            "Title must be at most 60 characters; hashtags must number 3 to 5. "
+            "Use #podcast only when the content profile is talk.")},
+        {"role": "user", "content": json.dumps({
+            "source_title": (source_meta or {}).get("title"),
+            "content_profile": content_profile,
+            "transcript": text,
+        }, ensure_ascii=False)},
+    ]
+    payload = {
+        "model": model, "messages": messages, "temperature": 0.2,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "clip_metadata", "strict": True,
+                            "schema": schema},
+        },
+    }
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get("CHOPIFY_HOSTED_LLM_API_KEY")
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    request = urllib.request.Request(
+        url.rstrip("/") + "/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        raw = result["choices"][0]["message"]["content"]
+        generated = json.loads(raw) if isinstance(raw, str) else raw
+        title = generated["title"].strip()
+        description = generated["description"].strip()
+        hashtags = generated["hashtags"]
+        if (not title or len(title) > 60 or not description
+                or not isinstance(hashtags, list) or not 3 <= len(hashtags) <= 5
+                or not all(isinstance(tag, str) and re.fullmatch(
+                    r"#[A-Za-z0-9_]+", tag.strip()) for tag in hashtags)):
+            return None, "failed"
+        hashtags = list(dict.fromkeys(tag.strip().lower() for tag in hashtags))
+        if content_profile != "talk":
+            hashtags = [tag for tag in hashtags if tag != "#podcast"]
+        if not 3 <= len(hashtags) <= 5:
+            return None, "failed"
+        return {"title": title, "description": description,
+                "hashtags": hashtags}, "ok"
+    except (OSError, AttributeError, KeyError, TypeError, ValueError, IndexError,
+            json.JSONDecodeError):
+        return None, "failed"
+
+
+def write_meta(seg, out_path, source_meta=None, content_profile="mixed",
+               words=None):
+    """Write ready-to-post metadata, using hosted generation only if configured."""
+    words = words or []
+    text = " ".join(str(word.get("word", "")).strip() for word in words).strip()
+    generated, llm_status = _hosted_metadata(
+        text, source_meta or {}, content_profile)
+    meta = generated or _fallback_metadata(
+        seg, source_meta or {}, content_profile, words)
+    meta.update({
         "score": seg.get("overall"),
         "start": seg.get("start"),
         "end": seg.get("end"),
-    }
+        "llm_status": llm_status,
+    })
     Path(out_path).with_suffix(".meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return Path(out_path).with_suffix(".meta.json")
@@ -627,17 +790,20 @@ def caption_from_args(args):
     return branding.validate_caption(caption) if supplied else None
 
 
-def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAULT_STYLE,
+def _render_impl(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAULT_STYLE,
            do_tighten=False, loudnorm=False, preview=False, brand=None,
-           layout="single", centers=(0.25, 0.75), caption=None,
-           source_offset=0.0, overlay="none", sound_effect="none"):
+           layout="auto", centers=(0.25, 0.75), caption=None,
+           source_offset=0.0, overlay="none", sound_effect="none",
+           source_meta=None, content_profile="mixed",
+           _center_crop_retry=False):
     from captions import write_srt
     out_dir = (Path(out_dir) if out_dir else default_out()).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     source = Path(source).resolve()
     resolved = resolve_caption(style, brand, caption)
-    if layout not in {"single", "split"} or (layout == "split" and aspect != "9:16"):
-        raise ValueError("Split-screen requires vertical 9:16 output.")
+    if layout not in {"auto", "single", "split", "blur-fit"} \
+            or (layout == "split" and aspect != "9:16"):
+        raise ValueError("Layout must be auto, single, split or blur-fit; split requires 9:16.")
     if len(centers) != 2 or any(not math.isfinite(v) or not 0 <= v <= 1 for v in centers):
         raise ValueError("Speaker centers must be between 0 and 1.")
     if overlay not in {"none", "pulse"}:
@@ -655,11 +821,17 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
         tw, th = full_w, full_h
     start = float(seg["start"])
     end = float(seg["end"])
-    dur = end - start
     offset = float(source_offset)
     if not math.isfinite(offset) or offset < 0:
         raise ValueError("Source offset must be a finite nonnegative number.")
-    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or dur <= 0:
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+        raise ValueError("Invalid clip start/end times.")
+    if start < offset - 1e-9:
+        raise ValueError("Clip start precedes its source section.")
+    start, end = padded_clip_bounds(
+        start, end, words, offset + ffprobe_duration(source), minimum=offset)
+    dur = end - start
+    if dur <= 0:
         raise ValueError("Invalid clip start/end times.")
     if start < offset - 1e-9:
         raise ValueError("Clip start precedes its source section.")
@@ -682,7 +854,26 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
     build_ass(cap_words, start, start + dur, out_dir / "_caption.ass",
               tw, th, font_size, margin_v, style, brand, caption)
 
-    needs_track = cw < W * 0.95          # real horizontal crop -> track the speaker
+    needs_track = cw < W * 0.95
+    detections = None
+    if layout == "auto" and needs_track:
+        try:
+            detections = detect_track(render_src, local_start, dur, W, workdir)
+        except Exception as exc:
+            if _center_crop_retry:
+                raise
+            print(f"  face tracking failed ({exc}); retrying with center crop",
+                  flush=True)
+            return render(
+                seg, words, source, W, H, workdir, aspect, out_dir=out_dir,
+                style=style, do_tighten=do_tighten, loudnorm=loudnorm,
+                preview=preview, brand=brand, layout="single", centers=centers,
+                caption=caption, source_offset=source_offset, overlay=overlay,
+                sound_effect=sound_effect, source_meta=source_meta,
+                content_profile=content_profile, _center_crop_retry=True)
+        layout, auto_centers = automatic_layout(detections, W, cw)
+        if layout == "split":
+            centers = auto_centers
     if layout == "split":
         # Keep every YUV420 panel even-sized. Older libass/ffmpeg builds can
         # crash on odd-height intermediate frames (854px drafts / 2 = 427).
@@ -694,8 +885,19 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
               f"scale={tw}:{panel_h}[bottom];[top][bottom]vstack=inputs=2,"
               f"pad={tw}:{th}:0:0,subtitles=_caption.ass")
         mode = "podcast split-screen"
-    elif needs_track:
-        track = smooth_track(detect_track(render_src, local_start, dur, W, workdir), W, cw)
+    elif layout == "blur-fit":
+        vf = (f"[0:v]split[bg][fg];"
+              f"[bg]scale={tw}:{th}:force_original_aspect_ratio=increase,"
+              f"crop={tw}:{th},boxblur=20:10[background];"
+              f"[fg]scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+              f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2[foreground];"
+              f"[background][foreground]overlay=(W-w)/2:(H-h)/2,"
+              "subtitles=_caption.ass")
+        mode = "blur-fit"
+    elif needs_track and layout in {"auto", "single"} and not _center_crop_retry:
+        detections = detections or detect_track(
+            render_src, local_start, dur, W, workdir)
+        track = smooth_track(detections["frames"], W, cw)
         build_sendcmd(track, cw, out_dir / "_crop.cmd")
         init_x = max(0, min(int(round(track[0][1] - cw / 2.0)), W - cw))
         vf = (f"sendcmd=f=_crop.cmd,crop={cw}:{ch}:{init_x}:{y0},"
@@ -726,10 +928,11 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(out)]
 
     graph_mode = bool((brand and brand.get("logo")) or layout == "split"
+                      or layout == "blur-fit"
                       or (overlay == "pulse" and cue_time is not None)
                       or use_sfx)
     if graph_mode:
-        graph = vf if layout == "split" else "[0:v]" + vf
+        graph = vf if layout in {"split", "blur-fit"} else "[0:v]" + vf
         if overlay == "pulse" and cue_time is not None:
             graph += "," + _pulse_filters(cue_time, tw, th)
         if brand and brand.get("logo"):
@@ -751,8 +954,7 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
             base_audio = (f"[{silence_input}:a]atrim=duration={dur:.3f},"
                           "asetpts=PTS-STARTPTS[base]")
         else:
-            base_filter = ("loudnorm=I=-14:TP=-1.5:LRA=11"
-                           if loudnorm else "anull")
+            base_filter = audio_filter_chain(dur, loudnorm)
             base_audio = (f"[0:a:0]asetpts=PTS-STARTPTS,"
                           f"{base_filter}[base]")
         delay_ms = max(0, round(cue_time * 1000))
@@ -767,14 +969,27 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
         cmd[cmd.index("-filter_complex") + 1] = graph_arg + ";" + audio_graph
         cmd[cmd.index("-c:v"):cmd.index("-c:v")] = [
             "-map", "[audio_out]"]
-    elif loudnorm:
+    elif not use_sfx:
         cmd[cmd.index("-c:v"):cmd.index("-c:v")] = [
-            "-af", "loudnorm=I=-14:TP=-1.5:LRA=11"]
+            "-af", audio_filter_chain(dur, loudnorm)]
 
     if graph_mode and not use_sfx:
         cmd[cmd.index("-c:v"):cmd.index("-c:v")] = ["-map", "0:a?"]
     print(">", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True, cwd=str(out_dir))
+    try:
+        subprocess.run(cmd, check=True, cwd=str(out_dir),
+                       stderr=subprocess.PIPE, text=True)
+    except subprocess.CalledProcessError:
+        if mode == "speaker-tracked" and not _center_crop_retry:
+            print("  tracked crop failed; retrying with center crop", flush=True)
+            return render(
+                seg, words, source, W, H, workdir, aspect, out_dir=out_dir,
+                style=style, do_tighten=do_tighten, loudnorm=loudnorm,
+                preview=preview, brand=brand, layout="single", centers=centers,
+                caption=caption, source_offset=source_offset, overlay=overlay,
+                sound_effect=sound_effect, source_meta=source_meta,
+                content_profile=content_profile, _center_crop_retry=True)
+        raise
     write_srt(cap_words, start, start + dur, out.with_suffix(".srt"),
               group_size=resolved["words_per_cue"])
 
@@ -799,19 +1014,60 @@ def render(seg, words, source, W, H, workdir, aspect, out_dir=None, style=DEFAUL
     poster = out.with_suffix(".png")
     subprocess.run(["ffmpeg", "-y", "-ss", f"{dur * 0.4:.2f}", "-i", str(out),
                     "-frames:v", "1", "-q:v", "2", str(poster)],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    meta_path = write_meta(seg, out)
+                   check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.PIPE, text=True)
+    clip_words = [word for word in cap_words
+                  if float(word["end"]) > start
+                  and float(word["start"]) < start + dur]
+    meta_path = write_meta(
+        seg, out, source_meta=source_meta,
+        content_profile=content_profile, words=clip_words)
 
     print(f"SAVED {out}  ({aspect} {tw}x{th}, {mode})  "
           f"+ poster {poster.name} + {meta_path.name}", flush=True)
     return out
 
 
+def render(seg, words, source, W, H, workdir, aspect, out_dir=None,
+           style=DEFAULT_STYLE, do_tighten=False, loudnorm=False, preview=False,
+           brand=None, layout="auto", centers=(0.25, 0.75), caption=None,
+           source_offset=0.0, overlay="none", sound_effect="none",
+           source_meta=None, content_profile="mixed",
+           _center_crop_retry=False):
+    """Render one clip and remove per-render scratch files on every exit path."""
+    cleanup_dir = (Path(out_dir) if out_dir else default_out()).resolve()
+    try:
+        return _render_impl(
+            seg, words, source, W, H, workdir, aspect, out_dir=out_dir,
+            style=style, do_tighten=do_tighten, loudnorm=loudnorm,
+            preview=preview, brand=brand, layout=layout, centers=centers,
+            caption=caption, source_offset=source_offset, overlay=overlay,
+            sound_effect=sound_effect, source_meta=source_meta,
+            content_profile=content_profile,
+            _center_crop_retry=_center_crop_retry)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        tail = "\n".join(stderr.splitlines()[-12:])
+        message = f"FFmpeg failed with exit code {exc.returncode}."
+        if tail:
+            message += "\nFFmpeg stderr tail:\n" + tail
+        raise RuntimeError(message) from exc
+    finally:
+        for name in ("_caption.ass", "_crop.cmd", "_tight_source.mp4",
+                     "_det.mp4"):
+            try:
+                (cleanup_dir / name).unlink()
+            except FileNotFoundError:
+                pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("workdir", nargs="?", default="work")
     ap.add_argument("--aspect", default=DEFAULT_ASPECT, choices=list(ASPECTS),
-                    help="output aspect ratio (default 16:9)")
+                    help="output aspect ratio (default 9:16)")
     ap.add_argument("--out", default=None,
                     help="output directory (default ./clips, or $CHOPIFY_OUT)")
     ap.add_argument("--style", default=DEFAULT_STYLE,
@@ -824,7 +1080,8 @@ def main():
                     help="render fast 480p drafts (no poster/meta) to review "
                          "clip selection before the full render")
     ap.add_argument("--brand", help="path to reusable JSON brand preset")
-    ap.add_argument("--layout", choices=["single", "split"], default="single")
+    ap.add_argument("--layout", choices=["auto", "single", "split", "blur-fit"],
+                    default="auto")
     ap.add_argument("--centers", type=float, nargs=2, default=[0.25, 0.75])
     add_caption_arguments(ap)
     args = ap.parse_args()
@@ -852,6 +1109,9 @@ def main():
     W, H = ffprobe_dims(source)
     print(f"Source {source} {W}x{H}; {len(segments)} clips -> {args.aspect} "
           f"(style={args.style}, tighten={args.tighten}) -> {out_dir}", flush=True)
+    selection_path = workdir / "selection.json"
+    selection = (json.loads(selection_path.read_text(encoding="utf-8-sig"))
+                 if selection_path.exists() else {})
 
     saved = []
     failed = 0
@@ -860,13 +1120,15 @@ def main():
               f"{seg.get('hook', '')[:60]!r} (overall {seg.get('overall')}) ---",
               flush=True)
         try:
-            saved.append(str(render({**seg, "id": f"{i:03}"}, words, source, W, H, workdir, args.aspect,
-                                    out_dir=out_dir, style=args.style,
-                                    do_tighten=args.tighten, loudnorm=args.loudnorm,
-                                    preview=args.preview, brand=brand,
-                                    layout=args.layout, centers=args.centers,
-                                    caption=caption)))
-        except subprocess.CalledProcessError as e:
+            saved.append(str(render(
+                {**seg, "id": f"{i:03}"}, words, source, W, H, workdir,
+                args.aspect, out_dir=out_dir, style=args.style,
+                do_tighten=args.tighten, loudnorm=args.loudnorm,
+                preview=args.preview, brand=brand, layout=args.layout,
+                centers=args.centers, caption=caption,
+                source_meta={"title": transcript.get("title")},
+                content_profile=selection.get("content_profile", "mixed"))))
+        except Exception as e:
             print(f"ERROR rendering clip {i}: {e}", flush=True)
             failed += 1
 

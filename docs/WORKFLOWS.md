@@ -7,7 +7,8 @@ clips. All transcription, scoring, editing, and rendering run on your computer.
 
 1. Run `python dashboard.py` and open the printed `127.0.0.1` address.
 2. Enter an absolute local video path or URL. Add one source per line for a batch.
-3. Choose aspect ratio, speech model, and starting caption style. In
+3. Choose aspect ratio, speech model, and starting caption style. Vertical 9:16
+   and a 90-second maximum clip length are the defaults. In
    **Transcription & scoring**, set the minimum score (default 8.0) and an
    optional preferred length. Click **Find clips**.
 4. Watch stage progress in the project list and open **Job log** for details.
@@ -24,6 +25,12 @@ clips. All transcription, scoring, editing, and rendering run on your computer.
    to the first visible caption. Save settings, then **Preview selected** to
    render small drafts; the source audio remains in the mix.
 9. **Export selected** creates MP4 + SRT + PNG poster + metadata JSON.
+
+Final clip metadata uses the source title and content profile, with a local
+first-sentence/keyword fallback. Hosted metadata and reranking remain disabled
+unless `CHOPIFY_HOSTED_LLM_URL` and `CHOPIFY_HOSTED_LLM_MODEL` are configured;
+when enabled, clip transcript text and the source title are sent to that
+OpenAI-compatible endpoint. `CHOPIFY_HOSTED_LLM_API_KEY` is optional.
 
 Jobs execute serially to avoid simultaneous model/encoder contention. You can add
 more videos while one is processing. Each project appears in the left rail.
@@ -251,7 +258,9 @@ The score is an editing suggestion, not a prediction or guarantee of virality.
   default limit.
 - `--preferred-len` is a soft prior. The engine may choose another length when
   that endpoint scores better.
-- The default range is 15–300 seconds. Widen `--min-len` / `--max-len` for
+-   The default range is 15–90 seconds. Use `--platform reels|shorts|tiktok` to
+  apply a platform-specific maximum and preferred length, or widen
+  `--min-len` / `--max-len` for
   longer-form material.
 - If nothing passes, the result is an empty clip list plus the real score range.
   Chopify never adds a fallback clip.

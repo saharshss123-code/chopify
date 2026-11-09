@@ -40,7 +40,7 @@ def test_render_playable_with_subtitles_and_brand(source, tmp_path, layout, prev
     streams = json.loads(subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json",
                                         str(out)], capture_output=True, text=True, check=True).stdout)["streams"]
     assert {s["codec_name"] for s in streams} >= {"h264", "aac"}
-    assert "00:00:00,000" in out.with_suffix(".srt").read_text()
+    assert "--> " in out.with_suffix(".srt").read_text()
     if layout == "split":
         video = next(s for s in streams if s["codec_type"] == "video")
         expected = render_clips.PREVIEW["9:16"] if preview else render_clips.ASPECTS["9:16"][:2]
@@ -63,6 +63,18 @@ def test_brand_colors_appear_in_ass(tmp_path):
     assert "&H00EFCDAB" in ass
 
 
+def test_blur_fit_preserves_full_source_over_vertical_background(source, tmp_path):
+    out = render_clips.render(
+        {"id": "blur-fit", "start": 0.5, "end": 2.5, "hook": "full frame"},
+        [], source, 640, 360, tmp_path, "9:16",
+        out_dir=tmp_path / "blur-fit", preview=True, layout="blur-fit")
+    streams = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(out)],
+        capture_output=True, text=True, check=True).stdout)["streams"]
+    video = next(stream for stream in streams if stream["codec_type"] == "video")
+    assert (video["width"], video["height"]) == render_clips.PREVIEW["9:16"]
+
+
 def test_tightened_srt_tracks_actual_shortened_video(source, tmp_path):
     words = [{"word": "Hello", "start": 0.1, "end": 0.5},
              {"word": "um", "start": 0.6, "end": 1.0},
@@ -78,6 +90,26 @@ def test_tightened_srt_tracks_actual_shortened_video(source, tmp_path):
     srt = out.with_suffix(".srt").read_text()
     assert "world." in srt
     assert " um " not in srt
+
+
+def test_clip_padding_stays_within_neighbor_gaps_and_keeps_captions_synced(
+        source, tmp_path):
+    words = [
+        {"word": "before", "start": 0.7, "end": 0.9},
+        {"word": "first", "start": 1.0, "end": 1.4},
+        {"word": "last", "start": 1.5, "end": 2.0},
+        {"word": "after", "start": 2.3, "end": 2.6},
+    ]
+    out = render_clips.render(
+        {"start": 1.0, "end": 2.0, "hook": "padded"}, words,
+        source, 640, 360, tmp_path, "16:9", out_dir=tmp_path / "padded",
+        preview=True, loudnorm=True)
+    duration = float(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(out)],
+        capture_output=True, text=True, check=True).stdout)
+    assert duration == pytest.approx(1.2, abs=0.15)
+    assert "00:00:00,050" in out.with_suffix(".srt").read_text()
 
 
 def test_boxed_pop_caption_render_and_matching_srt_groups(source, tmp_path):

@@ -123,6 +123,27 @@ class TestStyleResolution:
         assert style["animation"] == "pop"
         assert style["words_per_cue"] == 2
 
+    def test_logo_only_brand_preserves_hormozi_and_vertical_margin(self, tmp_path):
+        logo = tmp_path / "logo.png"
+        logo.write_bytes(b"fixture")
+        preset = tmp_path / "brand.json"
+        preset.write_text(json.dumps({"logo": "logo.png"}))
+        brand = branding.load_brand(preset)
+        style = render_clips.resolve_caption("hormozi", brand)
+        assert style["highlight"] == "#FF0000"
+        assert all(brand[key] is None for key in (
+            "font", "color", "highlight", "font_size", "margin"))
+
+        ass = tmp_path / "vertical.ass"
+        render_clips.build_ass(
+            [{"word": "secret", "start": 0, "end": 1}],
+            0, 1, ass, 1080, 1920, 96, 300, "hormozi", brand)
+        content = ass.read_text()
+        style_line = next(line for line in content.splitlines()
+                          if line.startswith("Style: Cap,"))
+        assert style_line.split(",")[-2] == "300"
+        assert "&H000000FF&" in content
+
     def test_precedence_preset_then_brand_then_project(self):
         brand = {"highlight": "#112233", "font": "Georgia"}
         caption = {"highlight": "#445566"}

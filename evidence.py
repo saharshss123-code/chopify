@@ -390,7 +390,7 @@ def timeline_has_signal(timeline):
 
 
 PROFILE_FLOORS = {"talk": 0.20, "mixed": 0.35, "gameplay/action": 0.60}
-PROFILE_BANDS = {"talk": (45, 180), "mixed": (30, 120),
+PROFILE_BANDS = {"talk": (30, 90), "mixed": (30, 120),
                  "gameplay/action": (15, 60)}
 NEUTRAL_SCORE = 5.0
 
@@ -567,4 +567,3 @@ def apply_evidence(candidate, audio=None, visual=None, profile="mixed",
             record["reason"] = (reason + " | " + phrase) if reason else phrase
             record["reason"] = record["reason"][:160]
     return record
-

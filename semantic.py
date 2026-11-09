@@ -74,7 +74,8 @@ def search(sentences, query, model=DEFAULT_MODEL, cache_dir=None, embed=None):
                   key=lambda r: r["similarity"], reverse=True)
 
 
-def candidates(sentences, query, model, cache_dir, min_len, max_len, max_clips):
+def candidates(sentences, query, model, cache_dir, min_len, max_len, max_clips,
+               language="en"):
     from score_clips import dedupe_candidates, discover_candidates
 
     matches = search(sentences, query, model, cache_dir)
@@ -83,7 +84,8 @@ def candidates(sentences, query, model, cache_dir, min_len, max_len, max_clips):
     if not similarity:
         return []
     found, _ = discover_candidates(sentences, min_len, max_len,
-                                   seed_indices=list(similarity))
+                                   seed_indices=list(similarity),
+                                   language=language)
     for item in found:
         item["similarity"] = similarity.get(item["seed_index"], 0.0)
     kept = dedupe_candidates(found)

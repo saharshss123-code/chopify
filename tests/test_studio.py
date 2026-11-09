@@ -172,7 +172,9 @@ class TestProjectOptions:
         import projects
         options = projects.validate_options({})
         assert options["min_len"] == 15
-        assert options["max_len"] == 300
+        assert options["max_len"] == 90
+        assert options["aspect"] == "9:16"
+        assert options["layout"] == "auto"
         assert options["max_clips"] is None
         assert options["min_score"] == 8.0
         assert options["preferred_len"] is None
@@ -188,6 +190,11 @@ class TestProjectOptions:
         with pytest.raises(ValueError):
             projects.validate_options({key: value})
 
+    @pytest.mark.parametrize("layout", ["auto", "single", "split", "blur-fit"])
+    def test_supported_framing_layouts(self, layout):
+        import projects
+        assert projects.validate_options({"layout": layout})["layout"] == layout
+
     @pytest.mark.parametrize(
         "has_audio,expected_base,tone_input",
         [(True, "[0:a:0]", "[1:a]"), (False, "[1:a]", "[2:a]")],
@@ -199,6 +206,7 @@ class TestProjectOptions:
         source = tmp_path / "source.mp4"
         source.write_bytes(b"fixture")
         monkeypatch.setattr(render_clips, "_has_audio", lambda _: has_audio)
+        monkeypatch.setattr(render_clips, "ffprobe_duration", lambda _: 10.0)
         calls = []
 
         def fake_run(command, **kwargs):
@@ -216,7 +224,7 @@ class TestProjectOptions:
         graph = command[command.index("-filter_complex") + 1]
         assert expected_base in graph
         assert tone_input in graph
-        assert "adelay=750:all=1" in graph
+        assert "adelay=1000:all=1" in graph
         assert "drawbox=" in graph
         maps = [command[i + 1] for i, value in enumerate(command[:-1])
                 if value == "-map"]
@@ -259,6 +267,15 @@ class TestProjectOptions:
             "transcript", {"words": []}, {**base, "min_score": 7.5})
         assert d1 == d2
         assert s1 != s2
+
+    def test_scoring_version_invalidates_discovery(self, monkeypatch):
+        import projects
+        base = projects.validate_options({})
+        first = projects.score_keys("transcript", {"words": []}, base)[0]
+        monkeypatch.setattr(projects, "SCORING_VERSION",
+                            projects.SCORING_VERSION + 1)
+        second = projects.score_keys("transcript", {"words": []}, base)[0]
+        assert first != second
 
 
 def test_validate_segments_allows_empty_and_preserves_fields():

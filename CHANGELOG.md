@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Logo-only brand files no longer override caption styles with default font,
+  color, highlight, font-size or margin values; explicit brand values still win.
+
 ### Added
 - `python chopify.py --version` prints the release version and exits 0 without
   requiring a source, ffmpeg or network.

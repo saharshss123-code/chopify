@@ -69,6 +69,16 @@ def test_config_exposes_caption_presets_and_defaults(server):
     assert any(rule["emoji"] == "💰" for rule in config["caption_emoji_rules"])
 
 
+def test_logo_only_brand_has_no_caption_overrides_in_config(server):
+    httpd, base = server
+    brands = httpd.app.root / "brands"
+    brands.mkdir(exist_ok=True)
+    (brands / "logo.png").write_bytes(b"fixture")
+    (brands / "logo-only.json").write_text(json.dumps({"logo": "logo.png"}))
+    config = request(base, "/api/config")
+    assert config["caption_brands"]["logo-only"] == {}
+
+
 def test_caption_style_saves_to_project_and_rejects_invalid(server):
     httpd, base = server
     project = request(base, "/api/projects", {"source": "recording.mp4", "options": {}}, httpd.app.token)

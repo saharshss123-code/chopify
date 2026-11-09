@@ -70,8 +70,8 @@
           <div class="form-grid">
             <label
               >Format<select id="new-aspect">
-                <option>16:9</option>
                 <option>9:16</option>
+                <option>16:9</option>
                 <option>1:1</option>
               </select></label
             >
@@ -237,20 +237,23 @@
             <form id="settings-form">
               <label
                 >Format<select name="aspect">
-                  <option>16:9</option>
                   <option>9:16</option>
+                  <option>16:9</option>
                   <option>1:1</option>
                 </select></label
               >
               <label
                 >Framing<select name="layout">
+                  <option value="auto">Auto · track, split, or blur-fit</option>
                   <option value="single">Single frame / face tracking</option>
                   <option value="split">Podcast · two stacked speakers</option>
+                  <option value="blur-fit">Blur-fit · preserve the full frame</option>
                 </select></label
               >
               <p class="hint">
-                Split-screen uses 9:16. Set each speaker's horizontal position
-                for fixed-camera footage.
+                Auto uses face tracking when useful, split framing for two
+                distant speakers, and blur-fit when faces are rare. Split uses
+                9:16; set speaker centers for fixed-camera footage.
               </p>
               <div class="pair">
                 <label
@@ -306,7 +309,7 @@
                     type="number"
                     min="1"
                     max="3600"
-                    value="300"
+                    value="90"
                     required
                 /></label>
               </div>
