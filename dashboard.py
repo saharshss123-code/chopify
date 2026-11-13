@@ -109,7 +109,8 @@ class Studio:
 
     def _run(self, path, action, preview, pick):
         cmd = [sys.executable, str(HERE / "chopify.py"), "--project", str(path),
-               "--action", action, "--out", str(path / ("previews" if preview else "clips"))]
+               "--action", action, "--no-input",
+               "--out", str(path / ("previews" if preview else "clips"))]
         if preview:
             cmd.append("--preview")
         if pick:
